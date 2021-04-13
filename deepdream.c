@@ -136,8 +136,8 @@ void conv2d_func(const op_ref_t * op, run_mode_t mode) {
 
         for (sy=-kh/2; sy<=kh/2; ++sy)
         for (sx=-kw/2; sx<=kw/2; ++sx, kmat += ci*co)
-        for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy)%p.stride_y==0)
-        for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx)%p.stride_x==0) {
+        for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy+1)%p.stride_y==0)
+        for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx+1)%p.stride_x==0) {
             const float * irow = input->val + (y*w+x)*ci;
             float * orow = output->val + ((y-sy)/p.stride_y*wo+(x-sx)/p.stride_x)*co;
             for (i=0; i<ci; ++i)
@@ -190,7 +190,7 @@ void lrn_func(const op_ref_t * op, run_mode_t mode) {
             for (i=0; i<r; ++i) ssum += sqr(input[row+i]);
             for (i=0; i<row_len; ++i) {
                 if (i+r<row_len) ssum += sqr(input[row+i+r]);
-                output[row+i] = output[row+i] / pow(p.bias + ssum*p.alpha, p.beta);
+                output[row+i] = input[row+i] / pow(p.bias + ssum*p.alpha, p.beta);
                 if (i-r>=0) ssum -= sqr(input[row+i-r]);
             }
         }
@@ -210,8 +210,8 @@ void maxpool_func(const op_ref_t * op, run_mode_t mode) {
 
         for (sy=-kh/2; sy<=kh/2; ++sy)
         for (sx=-kw/2; sx<=kw/2; ++sx)
-        for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy)%p.stride_y==0)
-        for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx)%p.stride_x==0) {
+        for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy+1)%p.stride_y==0)
+        for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx+1)%p.stride_x==0) {
             const float * irow = input->val + (y*w+x)*c;
             float * orow = output->val + ((y-sy)/p.stride_y*wo+(x-sx)/p.stride_x)*c;
             for (i=0; i<c; ++i) {
@@ -253,10 +253,12 @@ void write_tensor(const char *name, const tensor_t *tensor) {
 
 void forward(int target) {
     int i;
+    char fn[1024];
     for (i=0; i<=target; ++i) {
         /*printf("%s\n", g_ops[i].name);*/
         g_ops[i].run(g_ops+i, RUN_FORWARD);
-        /*write_tensor(g_ops[i].name, g_ops[i].output);*/
+        /*sprintf(fn, "out/%s", g_ops[i].name);
+        write_tensor(fn, g_ops[i].output);*/
     }
 }
 
@@ -280,18 +282,15 @@ int main(int arvc, const char * argv[]) {
     init_consts();
 
 
-    // f = fopen("input.dat", "rb");
-    // fread(g_data_val, FLOAT32_SIZE, g_data.size, f);
-    // fclose(f);
+    f = fopen("input.dat", "rb");
+    fread(g_data_val, FLOAT32_SIZE, g_data.size, f);
+    fclose(f);
     
     forward(g_ops_num-1);
 
     for (i=0; i<arvc; ++i) {
         printf("%s\n", argv[i]);
     }
-
-    printf("%f\n", g_conv1_7x7_s2_weights_val[0]);
-
 
     return 0;
 }

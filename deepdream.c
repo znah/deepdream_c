@@ -112,35 +112,41 @@ void fill_zeros(const tensor_t * t) {
     for (; i<t->size; ++i) t->val[i] = 0.0;
 }
 
-
 void const_func(const op_ref_t * op, run_mode_t mode) {}
 
 void conv2d_func(const op_ref_t * op, run_mode_t mode) {
-    if (mode==RUN_FORWARD) {
-        const tensor_t * input = op->input[0];
-        const tensor_t * kernel = op->input[1]; /* kh, kw, ci, co*/
-        const tensor_t * output = op->output;
-        const int kh = kernel->shape[0], kw = kernel->shape[1];
-        const int ci = kernel->shape[2], co = kernel->shape[3];
-        const int h = input->shape[0], w = input->shape[1];
-        const int wo = output->shape[1];
-        ivec2 stride = {1, 1};
-        if (op->params != NULL) {
-            stride = ((conv_op_t *)op->params)->stride;
-        }
-        const float * kmat = kernel->val;
-        int x, y, sx, sy, i, o;
-        fill_zeros(output);
+    const tensor_t * input = op->input[0];
+    const tensor_t * kernel = op->input[1]; /* kh, kw, ci, co*/
+    const tensor_t * output = op->output;
+    const int kh = kernel->shape[0], kw = kernel->shape[1];
+    const int ci = kernel->shape[2], co = kernel->shape[3];
+    const int h = input->shape[0], w = input->shape[1];
+    const int wo = output->shape[1];
+    ivec2 stride = {1, 1};
+    if (op->params != NULL) {
+        stride = ((conv_op_t *)op->params)->stride;
+    }
+    const float * kmat = kernel->val;
+    int x, y, sx, sy, i, o;
 
-        for (sy=-kh/2; sy<kh-kh/2; ++sy)
-        for (sx=-kw/2; sx<kw-kw/2; ++sx, kmat += ci*co)
-        for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy+1)%stride.y==0)
-        for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx+1)%stride.x==0) {
+    for (sy=-kh/2; sy<kh-kh/2; ++sy)
+    for (sx=-kw/2; sx<kw-kw/2; ++sx, kmat += ci*co)
+    for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy+1)%stride.y==0)
+    for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx+1)%stride.x==0) {
+        int o_ofs = ((y-sy)/stride.y*wo+(x-sx)/stride.x)*co;
+        if (mode == RUN_FORWARD) {
             const float * irow = input->val + (y*w+x)*ci;
-            float * orow = output->val + ((y-sy)/stride.y*wo+(x-sx)/stride.x)*co;
+            float * orow = output->val + o_ofs;
             for (i=0; i<ci; ++i)
             for (o=0; o<co; ++o) {
                 orow[o] += irow[i]*kmat[i*co + o];
+            }
+        } else {
+            float * irow = input->grad + (y*w+x)*ci;
+            const float * orow = output->grad + o_ofs;
+            for (i=0; i<ci; ++i)
+            for (o=0; o<co; ++o)  {
+                irow[i] += orow[o]*kmat[i*co + o];
             }
         }
     }
@@ -177,89 +183,116 @@ void relu_func(const op_ref_t * op, run_mode_t mode) {
 float sqr(float v) { return v*v; }
 
 void lrn_func(const op_ref_t * op, run_mode_t mode) {
-    if (mode==RUN_FORWARD) {
-        int size = op->input[0]->size;
-        int ndim = op->input[0]->ndim;
-        int row_len = op->input[0]->shape[ndim-1];
-        const float * input = op->input[0]->val;
-        float * output = op->output->val;
-        const lrn_op_t p = *(const lrn_op_t*)(op->params);
-        int r = p.depth_radius;
-        int row, i;
-        fill_zeros(op->output);
+    int size = op->input[0]->size;
+    int ndim = op->input[0]->ndim;
+    int depth = op->input[0]->shape[ndim-1];
+    const float * input = op->input[0]->val;
+    float * output = op->output->val;
+    const lrn_op_t p = *(const lrn_op_t*)(op->params);
+    int r = p.depth_radius;
+    int row, i, j;
+    float norm, norm_pow;
+    const float alpha_beta_2 = -2.0*p.alpha*p.beta;
 
-        for (row=0; row<size; row+=row_len) {
-            float ssum = 0.0;
-            for (i=0; i<r; ++i) ssum += sqr(input[row+i]);
-            for (i=0; i<row_len; ++i) {
-                if (i+r<row_len) ssum += sqr(input[row+i+r]);
-                output[row+i] = input[row+i] / pow(p.bias + ssum*p.alpha, p.beta);
-                if (i-r>=0) ssum -= sqr(input[row+i-r]);
+    for (row=0; row<size; row+=depth) {
+        float ssum = 0.0;
+        for (i=0; i<r; ++i) ssum += sqr(input[row+i]);
+        for (i=0; i<depth; ++i) {
+            if (i+r<depth) ssum += sqr(input[row+i+r]);
+            norm = p.bias + ssum*p.alpha;
+            norm_pow = pow(norm, -p.beta);
+            if (mode==RUN_FORWARD) {
+                output[row+i] = input[row+i] * norm_pow;
+            } else {
+                float out_grad = op->output->grad[row+i];
+                float activations_ab2 = output[row+i]*alpha_beta_2;
+                for (j=max(i-r, 0); j<min(i+r+1, depth); ++j) {
+                    float grad = input[row+j] * activations_ab2 / norm;
+                    if (i==j) {
+                        grad += norm_pow;
+                    }
+                    grad *= out_grad;
+                    op->input[0]->grad[row+j] += grad;
+                }
             }
+            if (i-r>=0) ssum -= sqr(input[row+i-r]);
         }
     }
 }
 
 void maxpool_func(const op_ref_t * op, run_mode_t mode) {
-    if (mode==RUN_FORWARD) {
-        const tensor_t * input = op->input[0];
-        const tensor_t * output = op->output;
-        const maxpool_op_t p = *(const maxpool_op_t*)(op->params);
-        const int kh = p.ksize.y, kw = p.ksize.x;
-        const int h = input->shape[0], w = input->shape[1], c = input->shape[2];
-        const int wo = output->shape[1];
-        int sx, sy, x, y, i;
-        fill_zeros(output);
+    const tensor_t * input = op->input[0];
+    const tensor_t * output = op->output;
+    const maxpool_op_t p = *(const maxpool_op_t*)(op->params);
+    const int kh = p.ksize.y, kw = p.ksize.x;
+    const int h = input->shape[0], w = input->shape[1], c = input->shape[2];
+    const int wo = output->shape[1];
+    int sx, sy, x, y, i;
 
-        for (sy=-kh/2; sy<kh-kh/2; ++sy)
-        for (sx=-kw/2; sx<kw-kw/2; ++sx)
-        for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy+1)%p.stride.y==0)
-        for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx+1)%p.stride.x==0) {
-            const float * irow = input->val + (y*w+x)*c;
-            float * orow = output->val + ((y-sy)/p.stride.y*wo+(x-sx)/p.stride.x)*c;
+    for (sy=-kh/2; sy<kh-kh/2; ++sy)
+    for (sx=-kw/2; sx<kw-kw/2; ++sx)
+    for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy+1)%p.stride.y==0)
+    for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx+1)%p.stride.x==0) {
+        const int i_ofs = (y*w+x)*c;
+        const int o_ofs = ((y-sy)/p.stride.y*wo+(x-sx)/p.stride.x)*c;
+        const float * irow = input->val + i_ofs;
+        float * orow = output->val + o_ofs;
+        if (mode==RUN_FORWARD) {
             for (i=0; i<c; ++i) {
-              orow[i] = maxf(orow[i], irow[i]);
+                orow[i] = maxf(orow[i], irow[i]);
+            }
+        } else {
+            for (i=0; i<c; ++i) {
+                if (orow[i] == irow[i]) {
+                    input->grad[i_ofs+i] += output->grad[o_ofs+i];
+                }
             }
         }
     }
 }
 
 void concatv2_func(const op_ref_t * op, run_mode_t mode) {
-    if (mode==RUN_FORWARD) {
-        const tensor_t * output = op->output;
-        const int co = output->shape[2];
-        int input_i = 0, ofs = 0;
-        for (; input_i<MAX_OP_INPUTS; ++input_i) {
-            int s=0, d=ofs, ci;
-            const tensor_t * input = op->input[input_i];
-            if (input == NULL) break;
-            ci = input->shape[2];
-            while (s<input->size) {
-                int i;
+    const tensor_t * output = op->output;
+    const int co = output->shape[2];
+    int input_i = 0, ofs = 0;
+    for (; input_i<MAX_OP_INPUTS; ++input_i) {
+        int s=0, d=ofs, ci;
+        const tensor_t * input = op->input[input_i];
+        if (input == NULL) break;
+        ci = input->shape[2];
+        while (s<input->size) {
+            int i;
+            if (mode==RUN_FORWARD) {
                 for (i=0; i<ci; ++i) {
                     output->val[d+i] = input->val[s+i];
                 }
-                s += ci; d += co;
+            } else {
+                for (i=0; i<ci; ++i) {
+                    input->grad[s+i] += output->grad[d+i];
+                }
             }
-            ofs += ci;
+            s += ci; d += co;
         }
+        ofs += ci;
     }
 }
 
 void avgpool_func(const op_ref_t * op, run_mode_t mode) {
+    const int depth = op->output->size;
+    const int n = op->input[0]->size; 
+    const float scale = 1.0/(n/depth);
+    int i;
     if (mode==RUN_FORWARD) {
         const float * input = op->input[0]->val;
         float * output = op->output->val;
-        const int depth = op->output->size;
-        const int n = op->input[0]->size; 
-        const float scale = 1.0/(n/depth);
-        int i;
-        fill_zeros(op->output);
         for (i=0; i < n; ++i) {
-            output[i%depth] += input[i];
+            output[i%depth] += input[i]*scale;
         }
-        for (i=0; i < depth; ++i) {
-            output[i] *= scale;
+    } else {
+        float * in_grad = op->input[0]->val;
+        const float * out_grad = op->output->val;
+        for (i=0; i < n; ++i) {
+            in_grad[i] += out_grad[i%depth]*scale;
         }
     }
 }
@@ -269,12 +302,12 @@ void matmul_func(const op_ref_t * op, run_mode_t mode) {
 }
 
 void softmax_func(const op_ref_t * op, run_mode_t mode) {
+    const int size = op->output->size;
+    int i;
     if (mode==RUN_FORWARD) {
         const float * input = op->input[0]->val;
         float * output = op->output->val;
-        const int size = op->output->size;
         float max_logit = input[0], exp_sum=0.0;
-        int i;
         for (i=1; i<size; ++i) {
             max_logit = maxf(max_logit, input[i]);
         }
@@ -286,9 +319,20 @@ void softmax_func(const op_ref_t * op, run_mode_t mode) {
         for (i=0; i<size; ++i) {
             output[i] /= exp_sum;
         }
+    } else {
+        /* grad_x = (grad_softmax - sum(grad_softmax * softmax)) * softmax */
+        const float * output = op->output->val;
+        const float * out_grad = op->output->grad;
+        float * in_grad = op->output->grad;
+        float sum = 0.0;
+        for (i=0; i<size; ++i) {
+            sum += output[i]*out_grad[i];
+        }
+        for (i=0; i<size; ++i) {
+            in_grad[i] += (out_grad[i] - sum) * output[i];
+        }
     }
 }
-
 
 void write_tensor(const char *name, const tensor_t *tensor) {
     FILE *f = fopen(name, "wb");
@@ -300,7 +344,6 @@ void forward(int target) {
     int i;
     char fn[1024];
     for (i=0; i<=target; ++i) {
-        /*printf("%s\n", g_ops[i].name);*/
         g_ops[i].run(g_ops+i, RUN_FORWARD);
         sprintf(fn, "out/%s", g_ops[i].name);
         write_tensor(fn, g_ops[i].output);
@@ -331,8 +374,10 @@ int main(int arvc, const char * argv[]) {
     fread(g_data_val, FLOAT32_SIZE, g_data.size, f);
     fclose(f);
 
-    for (int i=0; i<1; ++i)
+    for (int i=0; i<1; ++i) {
         forward(g_ops_num-1);
+        backward(g_ops_num-1);
+    }
 
     for (i=0; i<arvc; ++i) {
         printf("%s\n", argv[i]);

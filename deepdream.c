@@ -82,7 +82,7 @@ void init_consts() {
     FILE *f=fopen(model_filename, "rb");
     const op_ref_t * op = g_ops;
     for (; op<g_ops+g_ops_num; ++op) {
-        int i;
+        int i, j, k;
         const const_op_t * params;
         float * val;
         if (op->run != &const_func)
@@ -95,6 +95,18 @@ void init_consts() {
           if (fread(buf, FLOAT32_SIZE, 1, f) != 1)
             return;
           val[i] = parse_float32(buf);
+        }
+        if (op->output->ndim == 4) {
+            /* compute tranposed kernel for backward pass and store it in 'grad' */
+            float * grad = op->output->grad;
+            const int h = op->output->shape[2];
+            const int w = op->output->shape[3];
+            for (int k=0; k<op->output->size; k += w*h) {
+                for (i=0; i < h; ++i)
+                for (j=0; j < w; ++j) {
+                    grad[k + j*h + i] = val[k + i*w + j];
+                }
+            }
         }
 
     }
@@ -112,6 +124,7 @@ void fill_zeros(const tensor_t * t) {
     for (; i<t->size; ++i) t->val[i] = 0.0;
 }
 
+void placeholder_func(const op_ref_t * op, run_mode_t mode) {}
 void const_func(const op_ref_t * op, run_mode_t mode) {}
 
 void conv2d_func(const op_ref_t * op, run_mode_t mode) {
@@ -126,7 +139,7 @@ void conv2d_func(const op_ref_t * op, run_mode_t mode) {
     if (op->params != NULL) {
         stride = ((conv_op_t *)op->params)->stride;
     }
-    const float * kmat = kernel->val;
+    const float * kmat = (mode == RUN_FORWARD) ? kernel->val : kernel->grad;
     int x, y, sx, sy, i, o;
 
     for (sy=-kh/2; sy<kh-kh/2; ++sy)
@@ -144,9 +157,9 @@ void conv2d_func(const op_ref_t * op, run_mode_t mode) {
         } else {
             float * irow = input->grad + (y*w+x)*ci;
             const float * orow = output->grad + o_ofs;
-            for (i=0; i<ci; ++i)
-            for (o=0; o<co; ++o)  {
-                irow[i] += orow[o]*kmat[i*co + o];
+            for (o=0; o<co; ++o)
+            for (i=0; i<ci; ++i)  {
+                irow[i] += orow[o]*kmat[o*ci + i];
             }
         }
     }
@@ -227,15 +240,12 @@ void maxpool_func(const op_ref_t * op, run_mode_t mode) {
     const int kh = p.ksize.y, kw = p.ksize.x;
     const int hi = input->shape[0], wi = input->shape[1], c = input->shape[2];
     const int ho = output->shape[0], wo = output->shape[1];
-    int x, y, i, xk, yk;
+    int x, y, i, xi, yi, o_ofs=0;
 
-    for (y=0; y<ho; ++y)
-    for (x=0; x<wo; ++x)
-    for (i=0; i<c; ++i) {
-        int o_ofs = (y*wo+x)*c+i;
-        int argmax=0;
-        int xi = (x+1)*p.stride.x-1 - kw/2;
-        int yi = (y+1)*p.stride.y-1 - kh/2;
+    for (y=0, yi=p.stride.y-1-kh/2; y<ho; ++y, yi+=p.stride.y)
+    for (x=0, xi=p.stride.x-1-kw/2; x<wo; ++x, xi+=p.stride.x)
+    for (i=0; i<c; ++i, ++o_ofs) {
+        int xk, yk, argmax=0;
         float v_max = -1e10;
         for (yk=max(yi, 0); yk<min(yi+kh, hi); ++yk)
         for (xk=max(xi, 0); xk<min(xi+kw, wi); ++xk) {
@@ -252,28 +262,6 @@ void maxpool_func(const op_ref_t * op, run_mode_t mode) {
             input->grad[argmax] += output->grad[o_ofs];
         }
     }
-
-    /*for (sy=-kh/2; sy<kh-kh/2; ++sy)
-    for (sx=-kw/2; sx<kw-kw/2; ++sx)
-    for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy+1)%p.stride.y==0)
-    for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx+1)%p.stride.x==0) {
-        const int i_ofs = (y*w+x)*c;
-        const int o_ofs = ((y-sy)/p.stride.y*wo+(x-sx)/p.stride.x)*c;
-        const float * irow = input->val + i_ofs;
-        float * orow = output->val + o_ofs;
-        if (mode==RUN_FORWARD) {
-            for (i=0; i<c; ++i) {
-                if (irow[i]>orow[i])
-                    orow[i] = irow[i];
-            }
-        } else {
-            for (i=0; i<c; ++i) {
-                if (orow[i] == irow[i]) {
-                    input->grad[i_ofs+i] += output->grad[o_ofs+i];
-                }
-            }
-        }
-    }*/
 }
 
 void concatv2_func(const op_ref_t * op, run_mode_t mode) {
@@ -407,7 +395,7 @@ int validate_buffer(const char *fn, const int size, const float * buf) {
             printf(", tensor is smaller than expected! ");
             err = 1;
         }
-        if (v>1e-2) {
+        if (v>1e-3) {
             printf(", error is large! ");
             err = 1;
         }
@@ -418,6 +406,35 @@ int validate_buffer(const char *fn, const int size, const float * buf) {
 }
 
 const char * testdata_fn = "test/data";
+
+void print_top_scores() {
+    const int top_n = 5;
+    float score[top_n+1];
+    int index[top_n+1];
+    int i, j, k;
+    for (i=0; i<top_n; ++i) {
+        score[i] = -1e10;
+    }
+    for (i=0; i<g_prob.size; ++i) {
+        score[top_n] = g_prob.val[i];
+        index[top_n] = i;
+        for (j=top_n-1; j>=0; --j) {
+            float v;
+            if (score[j] >= score[j+1]) {
+                break;
+            }
+            v = score[j]; score[j] = score[j+1]; score[j+1] = v;
+            k = index[j]; index[j] = index[j+1]; index[j+1] = k;
+        }
+    }
+    printf("\nTop %d scores:\n", top_n);
+    for (i=0; i<top_n; ++i) {
+        j = index[i];
+        printf("  %.3f %d %s\n", score[i], j, pred_labels[j]);
+    }
+    printf("\n");
+}
+
 
 void validate_model() {
     int i;
@@ -441,8 +458,9 @@ void validate_model() {
             return;
         }
     }
-
+    print_top_scores();
     g_prob.grad[162] = 1.0;
+
     for (i=g_ops_num-1; i>=0; --i) {
         op = g_ops+i;
         sprintf(fn, "test/grad_%s", op->name);
@@ -465,12 +483,12 @@ int main(int arvc, const char * argv[]) {
     init_float32_exp();
     init_consts();
 
-    validate_model();
+    //validate_model();
 
-    // for (int i=0; i<1; ++i) {
-    //     forward(g_ops_num-1);
-    //     backward(g_ops_num-1);
-    // }
+    for (int i=0; i<10; ++i) {
+        forward(g_ops_num-1);
+        backward(g_ops_num-1);
+    }
 
     for (i=0; i<arvc; ++i) {
         printf("%s\n", argv[i]);

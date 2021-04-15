@@ -1,5 +1,5 @@
-#include <stdio.h>
-#include <math.h> /* TODO: remove */
+#include <stdio.h>  /* printf fopen fclose fseek fread fwrite */
+#include <math.h>   /* TODO: remove */
 
 typedef unsigned char uint8;
 
@@ -91,7 +91,7 @@ void init_consts() {
         val = op->output->val;
         fseek(f, params->ofs, SEEK_SET);
         for (i=0; i<op->output->size; ++i) {
-          uint8 buf[4];
+          uint8 buf[FLOAT32_SIZE];
           if (fread(buf, FLOAT32_SIZE, 1, f) != 1)
             return;
           val[i] = parse_float32(buf);
@@ -191,14 +191,15 @@ void lrn_func(const op_ref_t * op, run_mode_t mode) {
     const lrn_op_t p = *(const lrn_op_t*)(op->params);
     int r = p.depth_radius;
     int row, i, j;
-    float norm, norm_pow;
+    float norm, norm_pow, ssum;
     const float alpha_beta_2 = -2.0*p.alpha*p.beta;
 
     for (row=0; row<size; row+=depth) {
-        float ssum = 0.0;
-        for (i=0; i<r; ++i) ssum += sqr(input[row+i]);
         for (i=0; i<depth; ++i) {
-            if (i+r<depth) ssum += sqr(input[row+i+r]);
+            ssum = 0.0;
+            for (j=max(i-r, 0); j<min(i+r+1, depth); ++j) {
+                ssum += sqr(input[row+j]);
+            }
             norm = p.bias + ssum*p.alpha;
             norm_pow = pow(norm, -p.beta);
             if (mode==RUN_FORWARD) {
@@ -215,7 +216,6 @@ void lrn_func(const op_ref_t * op, run_mode_t mode) {
                     op->input[0]->grad[row+j] += grad;
                 }
             }
-            if (i-r>=0) ssum -= sqr(input[row+i-r]);
         }
     }
 }
@@ -225,11 +225,35 @@ void maxpool_func(const op_ref_t * op, run_mode_t mode) {
     const tensor_t * output = op->output;
     const maxpool_op_t p = *(const maxpool_op_t*)(op->params);
     const int kh = p.ksize.y, kw = p.ksize.x;
-    const int h = input->shape[0], w = input->shape[1], c = input->shape[2];
-    const int wo = output->shape[1];
-    int sx, sy, x, y, i;
+    const int hi = input->shape[0], wi = input->shape[1], c = input->shape[2];
+    const int ho = output->shape[0], wo = output->shape[1];
+    int x, y, i, xk, yk;
 
-    for (sy=-kh/2; sy<kh-kh/2; ++sy)
+    for (y=0; y<ho; ++y)
+    for (x=0; x<wo; ++x)
+    for (i=0; i<c; ++i) {
+        int o_ofs = (y*wo+x)*c+i;
+        int argmax=0;
+        int xi = (x+1)*p.stride.x-1 - kw/2;
+        int yi = (y+1)*p.stride.y-1 - kh/2;
+        float v_max = -1e10;
+        for (yk=max(yi, 0); yk<min(yi+kh, hi); ++yk)
+        for (xk=max(xi, 0); xk<min(xi+kw, wi); ++xk) {
+            int i_ofs = (yk*wi+xk)*c + i;
+            float v = input->val[i_ofs];
+            if (v > v_max) { 
+                v_max = v;
+                argmax = i_ofs;
+            }
+        }
+        if (mode==RUN_FORWARD) {
+            output->val[o_ofs] = v_max;
+        } else {
+            input->grad[argmax] += output->grad[o_ofs];
+        }
+    }
+
+    /*for (sy=-kh/2; sy<kh-kh/2; ++sy)
     for (sx=-kw/2; sx<kw-kw/2; ++sx)
     for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy+1)%p.stride.y==0)
     for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx+1)%p.stride.x==0) {
@@ -239,7 +263,8 @@ void maxpool_func(const op_ref_t * op, run_mode_t mode) {
         float * orow = output->val + o_ofs;
         if (mode==RUN_FORWARD) {
             for (i=0; i<c; ++i) {
-                orow[i] = maxf(orow[i], irow[i]);
+                if (irow[i]>orow[i])
+                    orow[i] = irow[i];
             }
         } else {
             for (i=0; i<c; ++i) {
@@ -248,7 +273,7 @@ void maxpool_func(const op_ref_t * op, run_mode_t mode) {
                 }
             }
         }
-    }
+    }*/
 }
 
 void concatv2_func(const op_ref_t * op, run_mode_t mode) {
@@ -289,8 +314,8 @@ void avgpool_func(const op_ref_t * op, run_mode_t mode) {
             output[i%depth] += input[i]*scale;
         }
     } else {
-        float * in_grad = op->input[0]->val;
-        const float * out_grad = op->output->val;
+        const float * out_grad = op->output->grad;
+        float * in_grad = op->input[0]->grad;
         for (i=0; i < n; ++i) {
             in_grad[i] += out_grad[i%depth]*scale;
         }
@@ -323,7 +348,7 @@ void softmax_func(const op_ref_t * op, run_mode_t mode) {
         /* grad_x = (grad_softmax - sum(grad_softmax * softmax)) * softmax */
         const float * output = op->output->val;
         const float * out_grad = op->output->grad;
-        float * in_grad = op->output->grad;
+        float * in_grad = op->input[0]->grad;
         float sum = 0.0;
         for (i=0; i<size; ++i) {
             sum += output[i]*out_grad[i];
@@ -334,9 +359,9 @@ void softmax_func(const op_ref_t * op, run_mode_t mode) {
     }
 }
 
-void write_tensor(const char *name, const tensor_t *tensor) {
+void write_data(const char *name, const int size, const float * data) {
     FILE *f = fopen(name, "wb");
-    fwrite(tensor->val, sizeof(float), tensor->size, f);
+    fwrite(data, sizeof(float), size, f);
     fclose(f);
 }
 
@@ -345,8 +370,6 @@ void forward(int target) {
     char fn[1024];
     for (i=0; i<=target; ++i) {
         g_ops[i].run(g_ops+i, RUN_FORWARD);
-        sprintf(fn, "out/%s", g_ops[i].name);
-        write_tensor(fn, g_ops[i].output);
     }
 }
 
@@ -357,8 +380,81 @@ void backward(int target) {
     }
 }
 
-
 int run_tests();
+
+int validate_buffer(const char *fn, const int size, const float * buf) {
+    int i, err=0;
+    float v, acc_v=0.0, max_dv=0.0;
+    uint8 tmp[FLOAT32_SIZE];
+    FILE *f = fopen(fn, "rb");
+    if (f == NULL)
+        return err; /* skip if file doesn't exist */
+    for (i=0; i<size; ++i) {
+          if (fread(tmp, FLOAT32_SIZE, 1, f) != 1) {
+              printf("tensor is larger than expected!");
+              err = 1;
+              break;
+          }
+          v = parse_float32(tmp);
+          acc_v += fabsf(v);
+          max_dv = maxf(max_dv, fabsf(v-buf[i]));
+    }
+    if (i == size) {
+        acc_v /= size;
+        v = max_dv/acc_v;
+        printf("relerr: %.3e, abserr: %.3e", v, max_dv);
+        if (fread(tmp, FLOAT32_SIZE, 1, f) != 0) {
+            printf(", tensor is smaller than expected! ");
+            err = 1;
+        }
+        if (v>1e-2) {
+            printf(", error is large! ");
+            err = 1;
+        }
+    }
+    fclose(f);
+    printf(" --- %s\n", fn);
+    return err;
+}
+
+const char * testdata_fn = "test/data";
+
+void validate_model() {
+    int i;
+    char fn[1024];
+    const op_ref_t * op;
+
+    printf("validating the model\n");
+    FILE * f = fopen(testdata_fn, "rb");
+    if (f == NULL) {
+        printf("undable to load %s!", testdata_fn);
+        return;
+    }
+    fread(g_data.val, FLOAT32_SIZE, g_data.size, f);
+    fclose(f);
+    for (i=0; i<g_ops_num; ++i) {
+        op = g_ops+i;
+        op->run(op, RUN_FORWARD);
+        sprintf(fn, "test/%s", op->name);
+        if (validate_buffer(fn, op->output->size, op->output->val) != 0) {
+            write_data(fn+5, op->output->size, op->output->val);
+            return;
+        }
+    }
+
+    g_prob.grad[162] = 1.0;
+    for (i=g_ops_num-1; i>=0; --i) {
+        op = g_ops+i;
+        sprintf(fn, "test/grad_%s", op->name);
+        if (validate_buffer(fn, op->output->size, op->output->grad) != 0) {
+            write_data(fn+5, op->output->size, op->output->grad);
+            return;
+        }
+        op->run(op, RUN_BACKWARD);
+    }
+
+}
+
 
 int main(int arvc, const char * argv[]) {
     int i=0;
@@ -369,15 +465,12 @@ int main(int arvc, const char * argv[]) {
     init_float32_exp();
     init_consts();
 
+    validate_model();
 
-    f = fopen("input.dat", "rb");
-    fread(g_data_val, FLOAT32_SIZE, g_data.size, f);
-    fclose(f);
-
-    for (int i=0; i<1; ++i) {
-        forward(g_ops_num-1);
-        backward(g_ops_num-1);
-    }
+    // for (int i=0; i<1; ++i) {
+    //     forward(g_ops_num-1);
+    //     backward(g_ops_num-1);
+    // }
 
     for (i=0; i<arvc; ++i) {
         printf("%s\n", argv[i]);
@@ -425,10 +518,11 @@ void print_tensor(const tensor_t *t) {
         }
         printf("\n");
     }
+    printf("\n");
 }
 
 void run_op(op_ref_t * op) {
-    printf("\n%s\n", op->name);
+    printf("%s\n", op->name);
     op->run(op, RUN_FORWARD);
     /*write_tensor("test_out", op->output);*/
     print_tensor(op->output);

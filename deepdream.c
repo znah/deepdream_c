@@ -1,6 +1,9 @@
 #include <stdio.h>  /* printf fopen fclose fseek fread fwrite */
 #include <math.h>   /* TODO: remove */
 
+/****************************** Neural Net data strucutres **********************************/
+/*                  Minimal set definitions used by "inception.inc"                         */
+/********************************************************************************************/
 typedef unsigned char uint8;
 
 enum {
@@ -44,6 +47,12 @@ void *_func(...)                -- forward declarations of net ops that we
                                    implement below
 */
 
+
+
+/********************************************************************************************/
+/*                                Utilities and heplers                                     */
+/********************************************************************************************/
+
 /*************** IEEE 74 32-bit float parsing (little-endian) ****************/
 enum {
   FLOAT32_SIZE = 4,
@@ -78,40 +87,8 @@ float parse_float32(const uint8 * p) {
                 * float32_exp_table[exponent];
 }
 
-void init_consts() {
-    FILE *f=fopen(model_filename, "rb");
-    const op_ref_t * op = g_ops;
-    for (; op<g_ops+g_ops_num; ++op) {
-        int i, j, k;
-        const const_op_t * params;
-        float * val;
-        if (op->run != &const_func)
-          continue;
-        params = (const_op_t*) (op->params);
-        val = op->output->val;
-        fseek(f, params->ofs, SEEK_SET);
-        for (i=0; i<op->output->size; ++i) {
-          uint8 buf[FLOAT32_SIZE];
-          if (fread(buf, FLOAT32_SIZE, 1, f) != 1)
-            return;
-          val[i] = parse_float32(buf);
-        }
-        if (op->output->ndim == 4) {
-            /* compute tranposed kernel for backward pass and store it in 'grad' */
-            float * grad = op->output->grad;
-            const int h = op->output->shape[2];
-            const int w = op->output->shape[3];
-            for (int k=0; k<op->output->size; k += w*h) {
-                for (i=0; i < h; ++i)
-                for (j=0; j < w; ++j) {
-                    grad[k + j*h + i] = val[k + i*w + j];
-                }
-            }
-        }
 
-    }
-    fclose(f);
-}
+/*************** Math functions ****************/
 
 float minf(float a, float b) { return a<b ? a : b; }
 float maxf(float a, float b) { return a>b ? a : b; }
@@ -119,10 +96,13 @@ float maxf(float a, float b) { return a>b ? a : b; }
 int min(int a, int b) { return a<b ? a : b; }
 int max(int a, int b) { return a>b ? a : b; }
 
-void fill_zeros(const tensor_t * t) {
-    int i=0;
-    for (; i<t->size; ++i) t->val[i] = 0.0;
-}
+float sqr(float v) { return v*v; }
+
+
+
+/********************************************************************************************/
+/*                              Neural Net layer functions                                  */
+/********************************************************************************************/
 
 void placeholder_func(const op_ref_t * op, run_mode_t mode) {}
 void const_func(const op_ref_t * op, run_mode_t mode) {}
@@ -192,8 +172,6 @@ void relu_func(const op_ref_t * op, run_mode_t mode) {
         }
     }
 }
-
-float sqr(float v) { return v*v; }
 
 void lrn_func(const op_ref_t * op, run_mode_t mode) {
     int size = op->input[0]->size;
@@ -347,15 +325,73 @@ void softmax_func(const op_ref_t * op, run_mode_t mode) {
     }
 }
 
+
+/********************************************************************************************/
+/*                              Initialization and support                                  */
+/********************************************************************************************/
+
+void init_consts() {
+    FILE *f=fopen(model_filename, "rb");
+    const op_ref_t * op = g_ops;
+    for (; op<g_ops+g_ops_num; ++op) {
+        int i, j, k;
+        const const_op_t * params;
+        float * val;
+        if (op->run != &const_func)
+          continue;
+        params = (const_op_t*) (op->params);
+        val = op->output->val;
+        fseek(f, params->ofs, SEEK_SET);
+        for (i=0; i<op->output->size; ++i) {
+          uint8 buf[FLOAT32_SIZE];
+          if (fread(buf, FLOAT32_SIZE, 1, f) != 1)
+            return;
+          val[i] = parse_float32(buf);
+        }
+        if (op->output->ndim == 4) {
+            /* compute tranposed kernel for backward pass and store it in 'grad' */
+            float * grad = op->output->grad;
+            const int h = op->output->shape[2];
+            const int w = op->output->shape[3];
+            for (int k=0; k<op->output->size; k += w*h) {
+                for (i=0; i < h; ++i)
+                for (j=0; j < w; ++j) {
+                    grad[k + j*h + i] = val[k + i*w + j];
+                }
+            }
+        }
+
+    }
+    fclose(f);
+}
+
+void fill_zeros(const tensor_t * t) {
+    int i=0;
+    for (; i<t->size; ++i) {
+        t->val[i] = 0.0;
+        t->grad[i] = 0.0;
+    }
+}
+
+
 void write_data(const char *name, const int size, const float * data) {
     FILE *f = fopen(name, "wb");
     fwrite(data, sizeof(float), size, f);
     fclose(f);
 }
 
+void reset_buffers() {
+    const op_ref_t * op = g_ops;
+    for (; op != g_ops+g_ops_num; ++op) {
+        if (op->run != const_func && op->run != placeholder_func) { 
+            fill_zeros(op->output);
+        }
+    }
+}
+
 void forward(int target) {
     int i;
-    char fn[1024];
+    reset_buffers();
     for (i=0; i<=target; ++i) {
         g_ops[i].run(g_ops+i, RUN_FORWARD);
     }
@@ -367,8 +403,6 @@ void backward(int target) {
       g_ops[i].run(g_ops+i, RUN_BACKWARD);
     }
 }
-
-int run_tests();
 
 int validate_buffer(const char *fn, const int size, const float * buf) {
     int i, err=0;
@@ -435,7 +469,6 @@ void print_top_scores() {
     printf("\n");
 }
 
-
 void validate_model() {
     int i;
     char fn[1024];
@@ -449,6 +482,9 @@ void validate_model() {
     }
     fread(g_data.val, FLOAT32_SIZE, g_data.size, f);
     fclose(f);
+
+    reset_buffers();
+
     for (i=0; i<g_ops_num; ++i) {
         op = g_ops+i;
         op->run(op, RUN_FORWARD);
@@ -476,14 +512,11 @@ void validate_model() {
 
 int main(int arvc, const char * argv[]) {
     int i=0;
-    FILE *f;
-
-    run_tests();
   
     init_float32_exp();
     init_consts();
 
-    //validate_model();
+    validate_model();
 
     for (int i=0; i<10; ++i) {
         forward(g_ops_num-1);
@@ -495,60 +528,4 @@ int main(int arvc, const char * argv[]) {
     }
 
     return 0;
-}
-
-float test_pulse_4x4_val[4*4] = {0, 0, 0, 0,
-                                 0, 1, 0, 0,
-                                 0, 0, 0, 0,
-                                 0, 0, 0, 1};
-tensor_t test_pulse_4x4 = {test_pulse_4x4_val, NULL, 4*4, 3, {4, 4, 1}};
-
-float test_pulse_3x3_val[3*3] = {0, 0, 0,
-                                 0, 1, 0,
-                                 0, 0, 0};
-tensor_t test_pulse_3x3 = {test_pulse_3x3_val, NULL, 3*3, 4, {3, 3, 1, 1}};
-
-float test_gx_3x3_val[3*3] = {1, 2, 3,
-                              4, 5, 6,
-                              7, 8, 9};
-tensor_t test_gx_3x3 = {test_gx_3x3_val, NULL, 3*3, 4, {3, 3, 1, 1}};
-
-float test_out_4x4_val[4*4];
-tensor_t test_out_4x4 = {test_out_4x4_val, NULL, 4*4, 3, {4, 4, 1}};
-
-float test_out_2x2_val[4*4];
-tensor_t test_out_2x2 = {test_out_2x2_val, NULL, 2*2, 3, {2, 2, 1}};
-
-conv_op_t test_conv_s1 = {1, 1};
-conv_op_t test_conv_s2 = {2, 2};
-op_ref_t test_ops[] = {
-    {conv2d_func, &test_conv_s1, "test_conv_3x3", &test_out_4x4, {&test_pulse_4x4, &test_gx_3x3}},
-    {conv2d_func, &test_conv_s2, "test_conv_3x3s2", &test_out_2x2, {&test_pulse_4x4, &test_gx_3x3}},
-};
-
-void print_tensor(const tensor_t *t) {
-    int i, j, k=0;
-    printf("ndim: %d, size: %d  (%d, %d, %d, %d)\n", t->ndim, t->size,
-        t->shape[0], t->shape[1], t->shape[2], t->shape[3]);
-    for (i=0; i<t->shape[0]; ++i) {
-        for (j=0; j<t->shape[1]; ++j) {
-            printf("%.2f  ", t->val[k]); ++k;
-        }
-        printf("\n");
-    }
-    printf("\n");
-}
-
-void run_op(op_ref_t * op) {
-    printf("%s\n", op->name);
-    op->run(op, RUN_FORWARD);
-    /*write_tensor("test_out", op->output);*/
-    print_tensor(op->output);
-}
-
-int run_tests() {
-    run_op(test_ops+0);
-    run_op(test_ops+1);
-
-    return 1;
 }

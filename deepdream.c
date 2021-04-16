@@ -1,8 +1,8 @@
-#include <stdio.h>  /* printf fopen fclose fseek fread fwrite */
+#include <stdio.h>  /* (s)printf fopen fclose fseek fread fwrite fflush */
 #include <math.h>   /* TODO: remove */
 
 /****************************** Neural Net data strucutres **********************************/
-/*                  Minimal set definitions used by "inception.inc"                         */
+/*                  Minimal set of definitions used in "inception.inc"                      */
 /********************************************************************************************/
 typedef unsigned char uint8;
 
@@ -92,11 +92,19 @@ float parse_float32(const uint8 * p) {
 
 float minf(float a, float b) { return a<b ? a : b; }
 float maxf(float a, float b) { return a>b ? a : b; }
+float clipf(float x, float a, float b) { return maxf(a, minf(x, b)); }
 
 int min(int a, int b) { return a<b ? a : b; }
 int max(int a, int b) { return a>b ? a : b; }
 
 float sqr(float v) { return v*v; }
+
+float sign(float v) {
+    if (v>0.0) { return 1.0;}
+    else if (v<0.0) { return -1.0; }
+    return 0.0;
+}
+
 
 
 
@@ -389,21 +397,6 @@ void reset_buffers() {
     }
 }
 
-void forward(int target) {
-    int i;
-    reset_buffers();
-    for (i=0; i<=target; ++i) {
-        g_ops[i].run(g_ops+i, RUN_FORWARD);
-    }
-}
-
-void backward(int target) {
-    int i;
-    for (i=target; i>=0; --i) {
-      g_ops[i].run(g_ops+i, RUN_BACKWARD);
-    }
-}
-
 int validate_buffer(const char *fn, const int size, const float * buf) {
     int i, err=0;
     float v, acc_v=0.0, max_dv=0.0;
@@ -467,21 +460,12 @@ void print_top_scores() {
     printf("\n");
 }
 
-// const char * testdata_fn = "test/data";
-
 void validate_model() {
     int i;
     char fn[1024];
     const op_ref_t * op;
 
     printf("validating the model\n");
-    /*FILE * f = fopen(testdata_fn, "rb");
-    if (f == NULL) {
-        printf("undable to load %s!", testdata_fn);
-        return;
-    }
-    fread(g_data.val, FLOAT32_SIZE, g_data.size, f);
-    fclose(f);*/
 
     reset_buffers();
 
@@ -522,19 +506,26 @@ int parse_int32(const uint8 *p) {
     return p[0] + (p[1]<<8) + (p[2]<<16) + (p[2]<<24);
 }
 
+void store_int32(uint8 *p, int v) {
+    p[0] = v&0xff;
+    p[1] = (v>>8)&0xff;
+    p[2] = (v>>16)&0xff;
+    p[3] = (v>>24)&0xff;
+}
 
+
+enum { BMP_HEADER_SIZE=14+40 };
 
 int load_bmp(const char * fn) {
-    enum { HEADER_SIZE=14+40 };
     FILE *f = fopen(fn, "rb");
-    uint8 buf[HEADER_SIZE];
+    uint8 buf[BMP_HEADER_SIZE];
     int i, r, image_offset, width, height, bpp, row_padding;
     int ofs, y_step, y;
     if (f == NULL) {
         printf("ERROR: unable to open '%s'\n", fn);
         return 1;
     }
-    r = fread(buf, HEADER_SIZE, 1, f);
+    r = fread(buf, BMP_HEADER_SIZE, 1, f);
     if (r != 1 || buf[0] != 'B' || buf[1] != 'M') {
         printf("ERROR: BMP header parsing error\n");
         fclose(f);
@@ -560,13 +551,12 @@ int load_bmp(const char * fn) {
     }
     fseek(f, image_offset, SEEK_SET);
     for (y=0; y<height; ++y, ofs += y_step) {
-        fread(g_img_data + ofs, width*3, 1, f);
+        if (fread(g_img_data + ofs, width*3, 1, f) != 1) {
+            printf("ERROR: image data loading error\n");
+            fclose(f);
+            return 1;
+        }
         fread(buf, row_padding, 1, f);
-    }
-    if (ferror(f) != 0) {
-        printf("ERROR: image data loading error\n");
-        fclose(f);
-        return 1;
     }
     fclose(f);
     g_img_width = width;
@@ -575,10 +565,71 @@ int load_bmp(const char * fn) {
     return 0;
 }
 
+int save_bmp(const char * fn) {
+    uint8 header[BMP_HEADER_SIZE] = {
+        66, 77, 54, 76,  2,  0,  0,  0,  0,  0, 54,  0,  0,  0, 40,  0,  0,  0,
+        224,  0,  0,  0,224,  0,  0,  0,  1,  0, 24,  0,  0,  0,  0,  0,  0, 76,
+        2,  0,196, 14,  0,  0,196, 14,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
+    };
+    const uint8 zero[4] = {0, 0, 0, 0};
+    int y, padding;
+    FILE *f = fopen(fn, "wb");
+    if (f == NULL) {
+        printf("ERROR: unable to open '%s' for writing\n", fn);
+        return 1;
+    }
+    padding = g_img_width % 4;
+    store_int32(header+18, g_img_width);
+    store_int32(header+22, g_img_height);
+    store_int32(header+34, (g_img_width*3+padding)*g_img_height);
+    fwrite(header, BMP_HEADER_SIZE, 1, f);
+    for (y=g_img_height-1; y>=0; y -= 1) {
+        fwrite(g_img_data + y*g_img_width*3, 1, g_img_width*3, f);
+        fwrite(zero, 1, padding, f);
+    }
+    fclose(f);
+    return 0;
+}
+
+void print_bar(const char * c, int i, int target) {
+    const int skip = 10;
+    int k;
+    i /= skip;
+    printf("\r[");
+    for (k=0; k<target/skip; ++k) {
+        printf("%s", k==i?c:"-");
+    }
+    printf("]");
+    fflush(stdout);
+}
+
+void forward(int target) {
+    int i;
+    reset_buffers();
+    for (i=0; i<=target; ++i) {
+        if (i%10==0) {
+            print_bar(">", i, target);
+        }
+        g_ops[i].run(g_ops+i, RUN_FORWARD);
+    }
+}
+
+void backward(int target) {
+    int i;
+    for (i=target; i>=0; --i) {
+        if (i%10==0) {
+            print_bar("<", i, target);
+        }
+        g_ops[i].run(g_ops+i, RUN_BACKWARD);
+    }
+}
+
+
+
 const float imagenet_mean_bgr[3] = {104.0, 116.7, 122.7};
 
 int main(int arvc, const char * argv[]) {
-    int x, y, c;
+    int x, y, c, i;
     const int data_w = 224;
     FILE * f;
   
@@ -601,7 +652,30 @@ int main(int arvc, const char * argv[]) {
         g_data.val[(y*data_w + x)*3+c] = v;
     }
 
-    validate_model();
+    //validate_model();
+    forward(g_ops_num-1);
+    print_top_scores();
+
+    for (c=0; c<5; ++c) {
+        g_prob.grad[852] = 1.0; /* tennis ball */
+        backward(g_ops_num-1);
+        for (i=0; i<g_data.size; ++i) {
+            g_data.val[i] += sign(g_data.grad[i])*0.5;
+        }
+        reset_buffers();
+        forward(g_ops_num-1);
+        print_top_scores();
+    }
+
+    for (y=0; y<min(data_w, g_img_height); ++y)
+    for (x=0; x<min(data_w, g_img_width); ++x)
+    for (c=0; c<3; ++c ){
+        float v = g_data.val[(y*data_w + x)*3+c];
+        v += imagenet_mean_bgr[c];
+        g_img_data[(y*g_img_width+x)*3+c] = clipf(v, 0.0, 255.0);
+    }    
+
+    save_bmp("t.bmp");
 
     // for (int i=0; i<1; ++i) {
     //     forward(g_ops_num-1);

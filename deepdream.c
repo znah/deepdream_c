@@ -116,11 +116,11 @@ void conv2d_func(const op_ref_t * op, run_mode_t mode) {
     const int h = input->shape[0], w = input->shape[1];
     const int wo = output->shape[1];
     ivec2 stride = {1, 1};
+    const float * kmat = (mode == RUN_FORWARD) ? kernel->val : kernel->grad;
+    int x, y, sx, sy, i, o;
     if (op->params != NULL) {
         stride = ((conv_op_t *)op->params)->stride;
     }
-    const float * kmat = (mode == RUN_FORWARD) ? kernel->val : kernel->grad;
-    int x, y, sx, sy, i, o;
 
     for (sy=-kh/2; sy<kh-kh/2; ++sy)
     for (sx=-kw/2; sx<kw-kw/2; ++sx, kmat += ci*co)
@@ -439,8 +439,6 @@ int validate_buffer(const char *fn, const int size, const float * buf) {
     return err;
 }
 
-const char * testdata_fn = "test/data";
-
 void print_top_scores() {
     const int top_n = 5;
     float score[top_n+1];
@@ -469,19 +467,21 @@ void print_top_scores() {
     printf("\n");
 }
 
+// const char * testdata_fn = "test/data";
+
 void validate_model() {
     int i;
     char fn[1024];
     const op_ref_t * op;
 
     printf("validating the model\n");
-    FILE * f = fopen(testdata_fn, "rb");
+    /*FILE * f = fopen(testdata_fn, "rb");
     if (f == NULL) {
         printf("undable to load %s!", testdata_fn);
         return;
     }
     fread(g_data.val, FLOAT32_SIZE, g_data.size, f);
-    fclose(f);
+    fclose(f);*/
 
     reset_buffers();
 
@@ -509,23 +509,108 @@ void validate_model() {
 
 }
 
+enum {MAX_IMAGE_SIZE = 4096};
+
+uint8 g_img_data[MAX_IMAGE_SIZE*MAX_IMAGE_SIZE*3];  /* BGR image data */
+int g_img_width, g_img_height;
+
+int parse_int16(const uint8 *p) {
+    return p[0] + (p[1]<<8);
+}
+
+int parse_int32(const uint8 *p) {
+    return p[0] + (p[1]<<8) + (p[2]<<16) + (p[2]<<24);
+}
+
+
+
+int load_bmp(const char * fn) {
+    enum { HEADER_SIZE=14+40 };
+    FILE *f = fopen(fn, "rb");
+    uint8 buf[HEADER_SIZE];
+    int i, r, image_offset, width, height, bpp, row_padding;
+    int ofs, y_step, y;
+    if (f == NULL) {
+        printf("ERROR: unable to open '%s'\n", fn);
+        return 1;
+    }
+    r = fread(buf, HEADER_SIZE, 1, f);
+    if (r != 1 || buf[0] != 'B' || buf[1] != 'M') {
+        printf("ERROR: BMP header parsing error\n");
+        fclose(f);
+        return 1;
+    }
+    image_offset = parse_int32(buf+10);
+    width = parse_int32(buf+18);
+    height = parse_int32(buf+22);
+    bpp = parse_int16(buf+28);
+    if (max(width, height) > MAX_IMAGE_SIZE || bpp != 24) {
+        printf("ERROR: only 24-bit RGB images, max(width, height) <= %d supported\n", MAX_IMAGE_SIZE);
+        fclose(f);
+        return 1;
+    }
+    row_padding = width % 4;
+    if (height < 0) {  /* is top-bottom row order? */
+        height = -height;
+        ofs = 0;
+        y_step = width*3;
+    } else {
+        ofs = (height-1)*width*3;
+        y_step = -width*3;
+    }
+    fseek(f, image_offset, SEEK_SET);
+    for (y=0; y<height; ++y, ofs += y_step) {
+        fread(g_img_data + ofs, width*3, 1, f);
+        fread(buf, row_padding, 1, f);
+    }
+    if (ferror(f) != 0) {
+        printf("ERROR: image data loading error\n");
+        fclose(f);
+        return 1;
+    }
+    fclose(f);
+    g_img_width = width;
+    g_img_height = height;
+    printf("loaded '%s' (%dx%d)\n", fn, width, height);
+    return 0;
+}
+
+const float imagenet_mean_bgr[3] = {104.0, 116.7, 122.7};
 
 int main(int arvc, const char * argv[]) {
-    int i=0;
+    int x, y, c;
+    const int data_w = 224;
+    FILE * f;
   
     init_float32_exp();
     init_consts();
 
+    if (load_bmp("cat_dog224.bmp") != 0) {
+        return 1;
+    }
+
+    f = fopen("t.dat", "wb");
+    fwrite(g_img_data, 1, g_img_height*g_img_width*3, f);
+    fclose(f);
+
+    for (y=0; y<min(data_w, g_img_height); ++y)
+    for (x=0; x<min(data_w, g_img_width); ++x)
+    for (c=0; c<3; ++c ){
+        float v = g_img_data[(y*g_img_width+x)*3+c];
+        v -= imagenet_mean_bgr[c];
+        g_data.val[(y*data_w + x)*3+c] = v;
+    }
+
     validate_model();
 
-    for (int i=0; i<10; ++i) {
-        forward(g_ops_num-1);
-        backward(g_ops_num-1);
-    }
+    // for (int i=0; i<1; ++i) {
+    //     forward(g_ops_num-1);
+    //     backward(g_ops_num-1);
+    // }
 
-    for (i=0; i<arvc; ++i) {
-        printf("%s\n", argv[i]);
-    }
+    // for (i=0; i<arvc; ++i) {
+    //     printf("%s\n", argv[i]);
+    // }
 
     return 0;
 }

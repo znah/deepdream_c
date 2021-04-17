@@ -20,7 +20,6 @@ typedef struct {
 } tensor_t;
 typedef const tensor_t * tensor_ptr_t;
 
-typedef struct { int ofs; } const_op_t;  /* weights offset in .pb file */
 typedef struct { ivec2 stride; } conv_op_t;
 typedef struct { ivec2 stride, ksize; } maxpool_op_t;
 typedef struct { int depth_radius; float alpha, beta, bias; } lrn_op_t;
@@ -35,6 +34,7 @@ struct op_ref_t {
     const char *name;
     const tensor_ptr_t output;
     const tensor_ptr_t input[MAX_OP_INPUTS];
+    const int const_ofs;  /* weights offset in .pb file for const ops */
 };
 
 #include "inception.inc"
@@ -52,6 +52,21 @@ void *_func(...)                -- forward declarations of net ops that we
 /********************************************************************************************/
 /*                                Utilities and heplers                                     */
 /********************************************************************************************/
+
+int parse_int16(const uint8 *p) {
+    return p[0] + (p[1]<<8);
+}
+
+int parse_int32(const uint8 *p) {
+    return p[0] + (p[1]<<8) + (p[2]<<16) + (p[2]<<24);
+}
+
+void store_int32(uint8 *p, int v) {
+    p[0] = v&0xff;
+    p[1] = (v>>8)&0xff;
+    p[2] = (v>>16)&0xff;
+    p[3] = (v>>24)&0xff;
+}
 
 /*************** IEEE 74 32-bit float parsing (little-endian) ****************/
 enum {
@@ -104,7 +119,6 @@ float sign(float v) {
     else if (v<0.0) { return -1.0; }
     return 0.0;
 }
-
 
 
 
@@ -343,13 +357,11 @@ void init_consts() {
     const op_ref_t * op = g_ops;
     for (; op<g_ops+g_ops_num; ++op) {
         int i, j, k;
-        const const_op_t * params;
         float * val;
         if (op->run != &const_func)
           continue;
-        params = (const_op_t*) (op->params);
         val = op->output->val;
-        fseek(f, params->ofs, SEEK_SET);
+        fseek(f, op->const_ofs, SEEK_SET);
         for (i=0; i<op->output->size; ++i) {
           uint8 buf[FLOAT32_SIZE];
           if (fread(buf, FLOAT32_SIZE, 1, f) != 1)
@@ -493,28 +505,17 @@ void validate_model() {
 
 }
 
-enum {MAX_IMAGE_SIZE = 4096};
+
+/********************************************************************************************/
+/*                                  Image manipulation                                      */
+/********************************************************************************************/
+enum { 
+    MAX_IMAGE_SIZE = 4096,
+    BMP_HEADER_SIZE=14+40
+};
 
 uint8 g_img_data[MAX_IMAGE_SIZE*MAX_IMAGE_SIZE*3];  /* BGR image data */
 int g_img_width, g_img_height;
-
-int parse_int16(const uint8 *p) {
-    return p[0] + (p[1]<<8);
-}
-
-int parse_int32(const uint8 *p) {
-    return p[0] + (p[1]<<8) + (p[2]<<16) + (p[2]<<24);
-}
-
-void store_int32(uint8 *p, int v) {
-    p[0] = v&0xff;
-    p[1] = (v>>8)&0xff;
-    p[2] = (v>>16)&0xff;
-    p[3] = (v>>24)&0xff;
-}
-
-
-enum { BMP_HEADER_SIZE=14+40 };
 
 int load_bmp(const char * fn) {
     FILE *f = fopen(fn, "rb");
@@ -567,9 +568,9 @@ int load_bmp(const char * fn) {
 
 int save_bmp(const char * fn) {
     uint8 header[BMP_HEADER_SIZE] = {
-        66, 77, 54, 76,  2,  0,  0,  0,  0,  0, 54,  0,  0,  0, 40,  0,  0,  0,
+         66, 77, 54, 76,  2,  0,  0,  0,  0,  0, 54,  0,  0,  0, 40,  0,  0,  0,
         224,  0,  0,  0,224,  0,  0,  0,  1,  0, 24,  0,  0,  0,  0,  0,  0, 76,
-        2,  0,196, 14,  0,  0,196, 14,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
+          2,  0,196, 14,  0,  0,196, 14,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
     };
     const uint8 zero[4] = {0, 0, 0, 0};
     int y, padding;
@@ -585,10 +586,40 @@ int save_bmp(const char * fn) {
     fwrite(header, BMP_HEADER_SIZE, 1, f);
     for (y=g_img_height-1; y>=0; y -= 1) {
         fwrite(g_img_data + y*g_img_width*3, 1, g_img_width*3, f);
-        fwrite(zero, 1, padding, f);
+        if (padding) {
+            fwrite(zero, 1, padding, f);
+        }
     }
     fclose(f);
     return 0;
+}
+
+
+const float imagenet_mean_bgr[3] = {104.0, 116.7, 122.7};
+
+void copy_img2net(int ofs_x, int ofs_y) {
+    const int tile_size = g_data.shape[0];
+    int x, y, c, dst = 0;
+    for (y=0; y<tile_size; ++y)
+    for (x=0; x<tile_size; ++x) {
+        int src = ((ofs_y+y)%g_img_height * g_img_width + (ofs_x+x)%g_img_width)*3;
+        for (c=0; c<3; ++c, ++dst ) {
+            g_data.val[dst] = g_img_data[src+c]-imagenet_mean_bgr[c];
+        }
+    }
+}
+
+void copy_net2img(int ofs_x, int ofs_y) {
+    const int tile_size = g_data.shape[0];
+    int x, y, c, src, dst;
+    for (y=0; y<min(tile_size, g_img_height); ++y)
+    for (x=0; x<min(tile_size, g_img_width); ++x) {
+        int src = (y*tile_size + x)*3;
+        int dst = ((ofs_y+y)%g_img_height * g_img_width + (ofs_x+x)%g_img_width)*3;
+        for (c=0; c<3; ++c ) {
+            g_img_data[dst+c] = clipf(g_data.val[src+c]+imagenet_mean_bgr[c], 0.0, 255.0);
+        }
+    }
 }
 
 void print_bar(const char * c, int i, int target) {
@@ -626,10 +657,8 @@ void backward(int target) {
 
 
 
-const float imagenet_mean_bgr[3] = {104.0, 116.7, 122.7};
-
 int main(int arvc, const char * argv[]) {
-    int x, y, c, i;
+    int x, y, c, i, pass;
     const int data_w = 224;
     FILE * f;
   
@@ -639,51 +668,31 @@ int main(int arvc, const char * argv[]) {
     if (load_bmp("cat_dog224.bmp") != 0) {
         return 1;
     }
-
-    f = fopen("t.dat", "wb");
-    fwrite(g_img_data, 1, g_img_height*g_img_width*3, f);
-    fclose(f);
-
-    for (y=0; y<min(data_w, g_img_height); ++y)
-    for (x=0; x<min(data_w, g_img_width); ++x)
-    for (c=0; c<3; ++c ){
-        float v = g_img_data[(y*g_img_width+x)*3+c];
-        v -= imagenet_mean_bgr[c];
-        g_data.val[(y*data_w + x)*3+c] = v;
-    }
+    copy_img2net(0, 0);
 
     //validate_model();
+    //return 0;
+    //printf("\033[2J\033[H");
     forward(g_ops_num-1);
     print_top_scores();
 
-    for (c=0; c<5; ++c) {
-        g_prob.grad[852] = 1.0; /* tennis ball */
+    for (pass=0; pass<5; ++pass) {
+        g_prob.grad[852] = 1.0;  /* tennis ball */
         backward(g_ops_num-1);
         for (i=0; i<g_data.size; ++i) {
             g_data.val[i] += sign(g_data.grad[i])*0.5;
         }
         reset_buffers();
         forward(g_ops_num-1);
+        printf("\033[2J\033[H");
         print_top_scores();
     }
-
-    for (y=0; y<min(data_w, g_img_height); ++y)
-    for (x=0; x<min(data_w, g_img_width); ++x)
-    for (c=0; c<3; ++c ){
-        float v = g_data.val[(y*data_w + x)*3+c];
-        v += imagenet_mean_bgr[c];
-        g_img_data[(y*g_img_width+x)*3+c] = clipf(v, 0.0, 255.0);
-    }    
-
+    copy_net2img(0, 0);
     save_bmp("t.bmp");
 
     // for (int i=0; i<1; ++i) {
     //     forward(g_ops_num-1);
     //     backward(g_ops_num-1);
-    // }
-
-    // for (i=0; i<arvc; ++i) {
-    //     printf("%s\n", argv[i]);
     // }
 
     return 0;

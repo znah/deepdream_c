@@ -20,6 +20,11 @@ typedef struct {
 } tensor_t;
 typedef const tensor_t * tensor_ptr_t;
 
+
+typedef struct {
+    const tensor_t * data; 
+    int ofs; /* weights offset in .pb file for const ops */
+} const_t; 
 typedef struct { ivec2 stride; } conv_op_t;
 typedef struct { ivec2 stride, ksize; } maxpool_op_t;
 typedef struct { int depth_radius; float alpha, beta, bias; } lrn_op_t;
@@ -34,7 +39,6 @@ struct op_ref_t {
     const char *name;
     const tensor_ptr_t output;
     const tensor_ptr_t input[MAX_OP_INPUTS];
-    const int const_ofs;  /* weights offset in .pb file for const ops */
 };
 
 #include "inception.inc"
@@ -46,8 +50,6 @@ op_ref_t g_ops[g_ops_num]       -- neural net operations list
 void *_func(...)                -- forward declarations of net ops that we 
                                    implement below
 */
-
-
 
 /********************************************************************************************/
 /*                                Utilities and heplers                                     */
@@ -66,6 +68,13 @@ void store_int32(uint8 *p, int v) {
     p[1] = (v>>8)&0xff;
     p[2] = (v>>16)&0xff;
     p[3] = (v>>24)&0xff;
+}
+
+void fill_zeros(int n, float * a) {
+    int i=0;
+    for (; i<n; ++i) {
+        a[i] = 0.0;
+    }
 }
 
 /*************** IEEE 74 32-bit float parsing (little-endian) ****************/
@@ -127,7 +136,25 @@ float sign(float v) {
 /********************************************************************************************/
 
 void placeholder_func(const op_ref_t * op, run_mode_t mode) {}
-void const_func(const op_ref_t * op, run_mode_t mode) {}
+
+/* Matrix-vector product function: y += xA, where A[n][m], x[n], y[m].
+
+Let's take a moment and appreciate this little function. Our program is going to
+spend 80%-90% of time executing this code. Most of what we call Machine Learning,
+Artificial Intelligence, Computational Physics, Numerical Simulation, etc. boils
+down to Linear Algebra and Matrix Multiplications. It's not surprising that plenty
+engineering efforts went into making this code run as fast as possible. Real world
+implementations of matrix-matrix and matrix-vector product functions are much more
+sophisticated than the one below. They use cache-optimal memory layouts,
+multiprocessing, special CPU instructions and dedicated hardware units. */
+
+void mul_matvec(float *y, const float *x, const float *A, int n, int m) {
+    int i, j;
+    for (i=0; i<n; ++i)
+    for (j=0; j<m; ++j) {
+        y[j] += x[i] * A[i*m + j];
+    }
+}
 
 void conv2d_func(const op_ref_t * op, run_mode_t mode) {
     const tensor_t * input = op->input[0];
@@ -135,34 +162,28 @@ void conv2d_func(const op_ref_t * op, run_mode_t mode) {
     const tensor_t * output = op->output;
     const int kh = kernel->shape[0], kw = kernel->shape[1];
     const int ci = kernel->shape[2], co = kernel->shape[3];
-    const int h = input->shape[0], w = input->shape[1];
-    const int wo = output->shape[1];
+    const int h = op->input[0]->shape[0], w = op->input[0]->shape[1];
+    const int wo = op->output->shape[1];
     ivec2 stride = {1, 1};
     const float * kmat = (mode == RUN_FORWARD) ? kernel->val : kernel->grad;
-    int x, y, sx, sy, i, o;
+    int x, y, sx, sy;
     if (op->params != NULL) {
         stride = ((conv_op_t *)op->params)->stride;
+    }
+    if (mode == RUN_FORWARD) {
+        fill_zeros(output->size, output->val);
     }
 
     for (sy=-kh/2; sy<kh-kh/2; ++sy)
     for (sx=-kw/2; sx<kw-kw/2; ++sx, kmat += ci*co)
     for (y=max(0, sy); y<min(h, h+sy); ++y) if ((y-sy+1)%stride.y==0)
     for (x=max(0, sx); x<min(w, w+sx); ++x) if ((x-sx+1)%stride.x==0) {
-        int o_ofs = ((y-sy)/stride.y*wo+(x-sx)/stride.x)*co;
+        int o = ((y-sy)/stride.y*wo+(x-sx)/stride.x)*co;
+        int i = (y*w+x)*ci;
         if (mode == RUN_FORWARD) {
-            const float * irow = input->val + (y*w+x)*ci;
-            float * orow = output->val + o_ofs;
-            for (i=0; i<ci; ++i)
-            for (o=0; o<co; ++o) {
-                orow[o] += irow[i]*kmat[i*co + o];
-            }
+            mul_matvec(output->val+o, input->val+i, kmat, ci, co);
         } else {
-            float * irow = input->grad + (y*w+x)*ci;
-            const float * orow = output->grad + o_ofs;
-            for (o=0; o<co; ++o)
-            for (i=0; i<ci; ++i)  {
-                irow[i] += orow[o]*kmat[o*ci + i];
-            }
+            mul_matvec(input->grad+i, output->grad+o, kmat, co, ci);
         }
     }
 }
@@ -298,6 +319,7 @@ void avgpool_func(const op_ref_t * op, run_mode_t mode) {
     if (mode==RUN_FORWARD) {
         const float * input = op->input[0]->val;
         float * output = op->output->val;
+        fill_zeros(depth, output);
         for (i=0; i < n; ++i) {
             output[i%depth] += input[i]*scale;
         }
@@ -354,26 +376,23 @@ void softmax_func(const op_ref_t * op, run_mode_t mode) {
 
 void init_consts() {
     FILE *f=fopen(model_filename, "rb");
-    const op_ref_t * op = g_ops;
-    for (; op<g_ops+g_ops_num; ++op) {
+    const const_t * c = g_consts;
+    for (; c<g_consts+g_consts_num; ++c) {
         int i, j, k;
-        float * val;
-        if (op->run != &const_func)
-          continue;
-        val = op->output->val;
-        fseek(f, op->const_ofs, SEEK_SET);
-        for (i=0; i<op->output->size; ++i) {
+        float * val = c->data->val;
+        fseek(f, c->ofs, SEEK_SET);
+        for (i=0; i<c->data->size; ++i) {
           uint8 buf[FLOAT32_SIZE];
           if (fread(buf, FLOAT32_SIZE, 1, f) != 1)
             return;
           val[i] = parse_float32(buf);
         }
-        if (op->output->ndim == 4) {
+        if (c->data->ndim == 4) {
             /* compute tranposed kernel for backward pass and store it in 'grad' */
-            float * grad = op->output->grad;
-            const int h = op->output->shape[2];
-            const int w = op->output->shape[3];
-            for (int k=0; k<op->output->size; k += w*h) {
+            float * grad = c->data->grad;
+            const int h = c->data->shape[2];
+            const int w = c->data->shape[3];
+            for (int k=0; k<c->data->size; k += w*h) {
                 for (i=0; i < h; ++i)
                 for (j=0; j < w; ++j) {
                     grad[k + j*h + i] = val[k + i*w + j];
@@ -385,14 +404,6 @@ void init_consts() {
     fclose(f);
 }
 
-void fill_zeros(const tensor_t * t) {
-    int i=0;
-    for (; i<t->size; ++i) {
-        t->val[i] = 0.0;
-        t->grad[i] = 0.0;
-    }
-}
-
 
 void write_data(const char *name, const int size, const float * data) {
     FILE *f = fopen(name, "wb");
@@ -400,12 +411,10 @@ void write_data(const char *name, const int size, const float * data) {
     fclose(f);
 }
 
-void reset_buffers() {
+void reset_gradients() {
     const op_ref_t * op = g_ops;
     for (; op != g_ops+g_ops_num; ++op) {
-        if (op->run != const_func && op->run != placeholder_func) { 
-            fill_zeros(op->output);
-        }
+        fill_zeros(op->output->size, op->output->grad);
     }
 }
 
@@ -479,8 +488,6 @@ void validate_model() {
 
     printf("validating the model\n");
 
-    reset_buffers();
-
     for (i=0; i<g_ops_num; ++i) {
         op = g_ops+i;
         op->run(op, RUN_FORWARD);
@@ -491,6 +498,7 @@ void validate_model() {
         }
     }
     print_top_scores();
+    reset_gradients();
     g_prob.grad[162] = 1.0;
 
     for (i=g_ops_num-1; i>=0; --i) {
@@ -510,8 +518,8 @@ void validate_model() {
 /*                                  Image manipulation                                      */
 /********************************************************************************************/
 enum { 
-    MAX_IMAGE_SIZE = 4096,
-    BMP_HEADER_SIZE=14+40
+    MAX_IMAGE_SIZE  = 4096,
+    BMP_HEADER_SIZE = 14+40
 };
 
 uint8 g_img_data[MAX_IMAGE_SIZE*MAX_IMAGE_SIZE*3];  /* BGR image data */
@@ -636,7 +644,6 @@ void print_bar(const char * c, int i, int target) {
 
 void forward(int target) {
     int i;
-    reset_buffers();
     for (i=0; i<=target; ++i) {
         if (i%10==0) {
             print_bar(">", i, target);
@@ -671,7 +678,6 @@ int main(int arvc, const char * argv[]) {
     copy_img2net(0, 0);
 
     //validate_model();
-    //return 0;
     //printf("\033[2J\033[H");
     forward(g_ops_num-1);
     print_top_scores();
@@ -682,9 +688,9 @@ int main(int arvc, const char * argv[]) {
         for (i=0; i<g_data.size; ++i) {
             g_data.val[i] += sign(g_data.grad[i])*0.5;
         }
-        reset_buffers();
         forward(g_ops_num-1);
-        printf("\033[2J\033[H");
+        reset_gradients();
+        //printf("\033[2J\033[H");
         print_top_scores();
     }
     copy_net2img(0, 0);

@@ -21,11 +21,15 @@ total_mem = 0
 last_const_ofs = 0
 aliases = {}
 tensors = []
+consts = []
 op_list = []
 
 def get_cname(s):
     s = s.split(':')[0]
-    return 'g_'+s.replace('/', '_')
+    chunks = s.split('/')
+    if len(chunks) == 2 and chunks[0] == chunks[1]:
+        chunks = chunks[:1]
+    return 'g_'+'_'.join(chunks)
 
 def resolve(s):
     while s in aliases:
@@ -46,9 +50,7 @@ def make_tensor(tensor, is_const):
             shape = (1, 1) + shape
     ndim = len(shape)
     name = get_cname(tensor.name)
-    #mul_shape_str = '*'.join(map(str, shape))
     shape_str = '{'+','.join(map(str, shape))+'}'
-    #tensors.append(f'\nfloat {name}_val[{mul_shape_str}];\n')
     size = np.prod(shape)
     val_ptr = f"g_mem+{total_mem}"
     total_mem += size
@@ -56,13 +58,11 @@ def make_tensor(tensor, is_const):
     if True:  # not is_const:
         grad_ptr = f"g_mem+{total_mem}"
         total_mem += size
-        #grad = name+'_grad'
-        #tensors.append(f'float {grad}[{mul_shape_str}];\n')
     tensors.append(
         f'const tensor_t {name} = {{ {val_ptr}, {grad_ptr}, {size}, {ndim}, {shape_str} }};\n')
     return True
 
-export_op_types = 'Placeholder Const Conv2D BiasAdd Relu LRN ConcatV2 MaxPool AvgPool MatMul Softmax'.split()
+export_op_types = 'Placeholder Conv2D BiasAdd Relu LRN ConcatV2 MaxPool AvgPool MatMul Softmax'.split()
 
 for op in graph.get_operations():
     name = get_cname(op.name)
@@ -80,13 +80,11 @@ for op in graph.get_operations():
     if op.type == 'Identity':
         continue
     params = 'NULL'
-    const_ofs = -1
     if op.type == 'Const':
         data = op.node_def.attr['value'].tensor.tensor_content
         const_ofs = graph_def_buf.find(data, last_const_ofs)
         last_const_ofs = const_ofs + len(data)
-        #tensors.append(f'const const_op_t {name}_op = {{ /*ofs*/ {ofs} }};\n')
-        #params = '&'+name+'_op'
+        consts.append(f'  {{ &{output_name}, {const_ofs} }},\n')
     elif op.type == 'Conv2D':
         _, sy, sx, _ = op.node_def.attr['strides'].list.i
         if sx != 1 or sy != 1:
@@ -111,7 +109,7 @@ for op in graph.get_operations():
     if op.type in export_op_types:
         inputs = ', '.join(['&'+s for s in inputs]) if inputs else 'NULL'
         op_list.append(
-            f' {{ &{op.type.lower()}_func, {params}, "{name[2:]}", &{output_name}, {{ {inputs} }}, {const_ofs} }},\n')
+            f' {{ &{op.type.lower()}_func, {params}, "{name[2:]}", &{output_name}, {{ {inputs} }} }},\n')
 
 
 with open('inception.inc', 'w') as f:
@@ -120,6 +118,10 @@ with open('inception.inc', 'w') as f:
     f.write(f'float g_mem[{total_mem}];\n\n');
 
     f.writelines(tensors)
+    f.write('\nenum { g_consts_num = %d };\n'%len(consts))
+    f.write('const const_t g_consts[] = {\n')
+    f.writelines(consts)
+    f.write('};\n')
 
     f.write('\n')
     for op in export_op_types:

@@ -60,7 +60,7 @@ int parse_int16(const uint8 *p) {
 }
 
 int parse_int32(const uint8 *p) {
-    return p[0] + (p[1]<<8) + (p[2]<<16) + (p[2]<<24);
+    return p[0] + (p[1]<<8) + (p[2]<<16) + (p[3]<<24);
 }
 
 void store_int32(uint8 *p, int v) {
@@ -117,6 +117,7 @@ float parse_float32(const uint8 * p) {
 float minf(float a, float b) { return a<b ? a : b; }
 float maxf(float a, float b) { return a>b ? a : b; }
 float clipf(float x, float a, float b) { return maxf(a, minf(x, b)); }
+//float fabs(float x) { return x<0.0 ? -x : x; }
 
 int min(int a, int b) { return a<b ? a : b; }
 int max(int a, int b) { return a>b ? a : b; }
@@ -487,7 +488,6 @@ void validate_model() {
     const op_ref_t * op;
 
     printf("validating the model\n");
-
     for (i=0; i<g_ops_num; ++i) {
         op = g_ops+i;
         op->run(op, RUN_FORWARD);
@@ -522,8 +522,10 @@ enum {
     BMP_HEADER_SIZE = 14+40
 };
 
-uint8 g_img_data[MAX_IMAGE_SIZE*MAX_IMAGE_SIZE*3];  /* BGR image data */
+uint8 g_img[MAX_IMAGE_SIZE*MAX_IMAGE_SIZE][3];  /* BGR image data */
 int g_img_width, g_img_height;
+const float imagenet_mean_bgr[3] = {104.0, 116.7, 122.7};
+
 
 int load_bmp(const char * fn) {
     FILE *f = fopen(fn, "rb");
@@ -553,14 +555,14 @@ int load_bmp(const char * fn) {
     if (height < 0) {  /* is top-bottom row order? */
         height = -height;
         ofs = 0;
-        y_step = width*3;
+        y_step = width;
     } else {
-        ofs = (height-1)*width*3;
-        y_step = -width*3;
+        ofs = (height-1)*width;
+        y_step = -width;
     }
     fseek(f, image_offset, SEEK_SET);
     for (y=0; y<height; ++y, ofs += y_step) {
-        if (fread(g_img_data + ofs, width*3, 1, f) != 1) {
+        if (fread(g_img + ofs, width*3, 1, f) != 1) {
             printf("ERROR: image data loading error\n");
             fclose(f);
             return 1;
@@ -593,7 +595,7 @@ int save_bmp(const char * fn) {
     store_int32(header+34, (g_img_width*3+padding)*g_img_height);
     fwrite(header, BMP_HEADER_SIZE, 1, f);
     for (y=g_img_height-1; y>=0; y -= 1) {
-        fwrite(g_img_data + y*g_img_width*3, 1, g_img_width*3, f);
+        fwrite(g_img + y*g_img_width, 1, g_img_width*3, f);
         if (padding) {
             fwrite(zero, 1, padding, f);
         }
@@ -602,17 +604,14 @@ int save_bmp(const char * fn) {
     return 0;
 }
 
-
-const float imagenet_mean_bgr[3] = {104.0, 116.7, 122.7};
-
 void copy_img2net(int ofs_x, int ofs_y) {
     const int tile_size = g_data.shape[0];
     int x, y, c, dst = 0;
     for (y=0; y<tile_size; ++y)
     for (x=0; x<tile_size; ++x) {
-        int src = ((ofs_y+y)%g_img_height * g_img_width + (ofs_x+x)%g_img_width)*3;
+        int src = (ofs_y+y)%g_img_height * g_img_width + (ofs_x+x)%g_img_width;
         for (c=0; c<3; ++c, ++dst ) {
-            g_data.val[dst] = g_img_data[src+c]-imagenet_mean_bgr[c];
+            g_data.val[dst] = g_img[src][c]-imagenet_mean_bgr[c];
         }
     }
 }
@@ -623,9 +622,9 @@ void copy_net2img(int ofs_x, int ofs_y) {
     for (y=0; y<min(tile_size, g_img_height); ++y)
     for (x=0; x<min(tile_size, g_img_width); ++x) {
         int src = (y*tile_size + x)*3;
-        int dst = ((ofs_y+y)%g_img_height * g_img_width + (ofs_x+x)%g_img_width)*3;
+        int dst = (ofs_y+y)%g_img_height * g_img_width + (ofs_x+x)%g_img_width;
         for (c=0; c<3; ++c ) {
-            g_img_data[dst+c] = clipf(g_data.val[src+c]+imagenet_mean_bgr[c], 0.0, 255.0);
+            g_img[dst][c] = clipf(g_data.val[src+c]+imagenet_mean_bgr[c]+0.5, 0.0, 255.0);
         }
     }
 }
@@ -662,23 +661,9 @@ void backward(int target) {
     }
 }
 
-
-
-int main(int arvc, const char * argv[]) {
-    int x, y, c, i, pass;
-    const int data_w = 224;
-    FILE * f;
-  
-    init_float32_exp();
-    init_consts();
-
-    if (load_bmp("cat_dog224.bmp") != 0) {
-        return 1;
-    }
+void run_adversarial() {
+    int pass, i;
     copy_img2net(0, 0);
-
-    //validate_model();
-    //printf("\033[2J\033[H");
     forward(g_ops_num-1);
     print_top_scores();
 
@@ -695,11 +680,124 @@ int main(int arvc, const char * argv[]) {
     }
     copy_net2img(0, 0);
     save_bmp("t.bmp");
+}
 
-    // for (int i=0; i<1; ++i) {
-    //     forward(g_ops_num-1);
-    //     backward(g_ops_num-1);
+int find_layer(const char * name) {
+    int i=0;
+    for (; i<g_ops_num; ++i) {
+        if (g_ops[i].name == name) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void sample_bilinear(int x, int y, uint8 * dst) {
+    int u = x&0xff, v = y&0xff;
+    x = x>>8; y = y>>8;
+    int w = g_img_width, o = y*w+x, c;
+    for (c=0; c<3; ++c) {
+        uint8 a = (g_img[o][c]*(255-u) + g_img[o+1][c]*u)>>8;
+        uint8 b = (g_img[o+w][c]*(255-u) + g_img[o+w+1][c]*u)>>8;
+        dst[c] = (a*(255-v) + b*v)>>8;
+    }
+}
+
+void upscale_image() {
+    int new_width = g_img_width*14/10;
+    int new_height = g_img_height*14/10;
+    int x, y;
+    for (y=new_height-1; y>=0; --y) {
+        int sy = (y<<8)*10/14;
+        for (x=new_width-1;  x>=0; --x) {
+            int sx = (x<<8)*10/14;
+            sample_bilinear(sx, sy, g_img[y*new_width + x]);
+        }
+    }
+    g_img_width = new_width;
+    g_img_height = new_height;
+}
+
+void render_octave(int target_i) {
+    const int tile_size = g_data.shape[0];
+    const int step_n = 20;
+    const tensor_t * target = g_ops[target_i].output;
+    float acc;
+    int x, y, i, step;
+    int tile_h = (g_img_height+tile_size-1)/tile_size;
+    int tile_w = (g_img_width+tile_size-1)/tile_size;
+    int tile_n=tile_w*tile_w;
+    for (step=0; step<step_n; ++step) {
+        int sx=step*79, sy=step*127;
+        int tile_count=0;
+        for (y=0; y<g_img_height; y+=tile_size)
+        for (x=0; x<g_img_width; x+=tile_size, ++tile_count) {
+            copy_img2net(x+sx, y+sy);
+            forward(target_i);
+            reset_gradients();
+            for (i=0; i<target->size; ++i) {
+                target->grad[i] = target->val[i];
+            }
+            backward(target_i);
+            acc = 0.0;
+            for (i=0; i<g_data.size; ++i) {
+                acc += sqr(g_data.grad[i]);
+            }
+            //acc /= g_data.size;
+            acc = sqrt(acc);
+            for (i=0; i<g_data.size; ++i) {
+                g_data.val[i] += 1000.0*g_data.grad[i]/acc;
+            }
+            copy_net2img(x+sx, y+sy);
+            printf(" %d/%d %d/%d ", tile_count+1, tile_n, step+1, step_n);
+        }
+    }
+}
+
+void run_deepdream() {
+    int target_i = find_layer("inception_4c_output"); /*pool4 4c*/ // pool3_3x3_s2 pool3_3x3_s2
+    int octave;
+    char s[128];
+    for (octave=0; octave<7; ++octave) {
+        if (octave > 0) {
+            upscale_image();
+        }
+        render_octave(target_i);
+        sprintf(s, "out%d.bmp", octave);
+        save_bmp(s);
+        printf("saved %dx%d\n", g_img_width, g_img_height);
+    }
+}
+
+int main(int arvc, const char * argv[]) {
+    int x, y, c, i, pass;
+    const int data_w = 224;
+    FILE * f;
+  
+    init_float32_exp();
+    init_consts();
+
+    if (load_bmp("cat_dog224.bmp") != 0) {
+        return 1;
+    }
+    //copy_img2net(0, 0);
+    //validate_model();
+
+    // for (i=0; i<6; ++i) {
+    //     upscale_image();
+    //     printf("%d %d\n", g_img_width, g_img_height);
     // }
+    // upscale_image();
+    // upscale_image();
+    //upscale_image();
+    //save_bmp("t.bmp");
+
+    
+    //run_adversarial();
+    run_deepdream();
+
+
+    //printf("\033[2J\033[H");
 
     return 0;
 }

@@ -16,7 +16,6 @@ DT_FLOAT = 1
 FLOAT_SIZE = 4
 
 
-
 total_mem = 0
 last_const_ofs = 0
 aliases = {}
@@ -139,7 +138,7 @@ with open('inception.inc', 'w') as f:
         f.write(f'  "{s}",\n')
     f.write('};\n')
 
-print('total_mem', total_mem*FLOAT_SIZE/2**20)
+print('total_mem (mb)', total_mem*FLOAT_SIZE/2**20)
 
 
 # del graph_def.node[0]  # placeholder

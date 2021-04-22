@@ -1,8 +1,27 @@
+/********************************************************************************************/
+
+/*
+We didn't have Tensorflow, PyTorch, JAX, Caffe or any other differentiable
+programming framework. We didn't have BLAS and any library for image loading,
+saving and resizing. We refrained from using dynamic memory allocation and
+ditched the assumption that the CPU uses IEEE-754 standard to represent
+floating-point numbers. We restricted the code to the subset of C89
+language, excluding preprocessor macros and many other things. Our only
+includes were <stdio.h> and <math.h>. We made sure that the program
+takes less than a second to compile with any compiler we tried.
+Not that it all was needed to make the program portable and easy to build,
+but when you start removing dependencies, the tendency is to push it
+as far as you can.
+*/
+
+/********************************************************************************************/
+
 #include <stdio.h>  /* (s)printf fopen fclose fseek fread fwrite fflush */
-#include <math.h>   /* TODO: remove */
+#include <math.h>   /* pow sqrt exp fabs */
+
 
 /****************************** Neural Net data strucutres **********************************/
-/*                  Minimal set of definitions used in "inception.inc"                      */
+/*               Minimal set of definitions required for "inception.inc"                    */
 /********************************************************************************************/
 typedef unsigned char uint8;
 
@@ -23,7 +42,7 @@ typedef const tensor_t * tensor_ptr_t;
 
 typedef struct {
     const tensor_t * data; 
-    int ofs; /* weights offset in .pb file for const ops */
+    int ofs;  /* weights offset in .pb file */
 } const_t; 
 typedef struct { ivec2 stride; } conv_op_t;
 typedef struct { ivec2 stride, ksize; } maxpool_op_t;
@@ -77,7 +96,7 @@ void fill_zeros(int n, float * a) {
     }
 }
 
-/*************** IEEE 74 32-bit float parsing (little-endian) ****************/
+/*************** IEEE-754 32-bit float parsing (little-endian) ****************/
 enum {
   FLOAT32_SIZE = 4,
   FLOAT32_MANTISSA_BIT = (1<<23)
@@ -94,7 +113,7 @@ void init_float32_exp() {
         b *= 2.0;
     }
     float32_exp_table[0] = float32_exp_table[1]; /* subnomal */
-    float32_exp_table[2] = 1.0/0.0;            /* infinity */
+    float32_exp_table[255] = 1.0/0.0;            /* infinity */
 }
 
 float parse_float32(const uint8 * p) {
@@ -117,19 +136,17 @@ float parse_float32(const uint8 * p) {
 float minf(float a, float b) { return a<b ? a : b; }
 float maxf(float a, float b) { return a>b ? a : b; }
 float clipf(float x, float a, float b) { return maxf(a, minf(x, b)); }
-//float fabs(float x) { return x<0.0 ? -x : x; }
 
 int min(int a, int b) { return a<b ? a : b; }
 int max(int a, int b) { return a>b ? a : b; }
 
-float sqr(float v) { return v*v; }
+float sqr(float x) { return x*x; }
 
 float sign(float v) {
     if (v>0.0) { return 1.0;}
     else if (v<0.0) { return -1.0; }
     return 0.0;
 }
-
 
 
 /********************************************************************************************/
@@ -198,7 +215,7 @@ void biasadd_func(const op_ref_t * op, run_mode_t mode) {
         for (i=0; i < op->output->size; ++i) {
             val[i] += bias[i%bias_len];
         }
-    } // do nothing on the backward pass
+    } /* do nothing on the backward pass */
 }
 
 
@@ -216,6 +233,7 @@ void relu_func(const op_ref_t * op, run_mode_t mode) {
         }
     }
 }
+
 
 void lrn_func(const op_ref_t * op, run_mode_t mode) {
     int size = op->input[0]->size;
@@ -393,14 +411,13 @@ void init_consts() {
             float * grad = c->data->grad;
             const int h = c->data->shape[2];
             const int w = c->data->shape[3];
-            for (int k=0; k<c->data->size; k += w*h) {
+            for (k=0; k<c->data->size; k += w*h) {
                 for (i=0; i < h; ++i)
                 for (j=0; j < w; ++j) {
                     grad[k + j*h + i] = val[k + i*w + j];
                 }
             }
         }
-
     }
     fclose(f);
 }
@@ -433,8 +450,8 @@ int validate_buffer(const char *fn, const int size, const float * buf) {
               break;
           }
           v = parse_float32(tmp);
-          acc_v += fabsf(v);
-          max_dv = maxf(max_dv, fabsf(v-buf[i]));
+          acc_v += fabs(v);
+          max_dv = maxf(max_dv, fabs(v-buf[i]));
     }
     if (i == size) {
         acc_v /= size;
@@ -455,7 +472,7 @@ int validate_buffer(const char *fn, const int size, const float * buf) {
 }
 
 void print_top_scores() {
-    const int top_n = 5;
+    enum { top_n = 5 };
     float score[top_n+1];
     int index[top_n+1];
     int i, j, k;
@@ -675,7 +692,6 @@ void run_adversarial() {
         }
         forward(g_ops_num-1);
         reset_gradients();
-        //printf("\033[2J\033[H");
         print_top_scores();
     }
     copy_net2img(0, 0);
@@ -694,8 +710,9 @@ int find_layer(const char * name) {
 
 void sample_bilinear(int x, int y, uint8 * dst) {
     int u = x&0xff, v = y&0xff;
+    int w = g_img_width, o, c;
     x = x>>8; y = y>>8;
-    int w = g_img_width, o = y*w+x, c;
+    o = y*w+x;
     for (c=0; c<3; ++c) {
         uint8 a = (g_img[o][c]*(255-u) + g_img[o+1][c]*u)>>8;
         uint8 b = (g_img[o+w][c]*(255-u) + g_img[o+w+1][c]*u)>>8;
@@ -746,7 +763,7 @@ void render_octave(int target_i) {
             //acc /= g_data.size;
             acc = sqrt(acc);
             for (i=0; i<g_data.size; ++i) {
-                g_data.val[i] += 1000.0*g_data.grad[i]/acc;
+                g_data.val[i] += 800.0*g_data.grad[i]/acc; /*1000.0*/
             }
             copy_net2img(x+sx, y+sy);
             printf(" %d/%d %d/%d ", tile_count+1, tile_n, step+1, step_n);
@@ -754,11 +771,11 @@ void render_octave(int target_i) {
     }
 }
 
-void run_deepdream() {
+void run_deepdream(int octave_n) {
     int target_i = find_layer("inception_4c_output"); /*pool4 4c*/ // pool3_3x3_s2 pool3_3x3_s2
     int octave;
     char s[128];
-    for (octave=0; octave<7; ++octave) {
+    for (octave=0; octave<octave_n; ++octave) {
         if (octave > 0) {
             upscale_image();
         }
@@ -780,24 +797,14 @@ int main(int arvc, const char * argv[]) {
     if (load_bmp("cat_dog224.bmp") != 0) {
         return 1;
     }
-    //copy_img2net(0, 0);
-    //validate_model();
-
-    // for (i=0; i<6; ++i) {
-    //     upscale_image();
-    //     printf("%d %d\n", g_img_width, g_img_height);
-    // }
-    // upscale_image();
-    // upscale_image();
-    //upscale_image();
-    //save_bmp("t.bmp");
-
+    copy_img2net(0, 0);
+    validate_model();
     
     //run_adversarial();
-    run_deepdream();
+    run_deepdream(1);
 
 
-    //printf("\033[2J\033[H");
+    /*printf("\033[2J\033[H");*/
 
     return 0;
 }

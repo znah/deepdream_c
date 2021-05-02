@@ -1,6 +1,6 @@
-/********************************************************************************************/
+/********************************************************************************************
 
-/*
+
 We didn't have Tensorflow, PyTorch, JAX, Caffe or any other differentiable
 programming framework. We didn't have BLAS and any library for image loading,
 saving and resizing. We refrained from using dynamic memory allocation and
@@ -12,12 +12,11 @@ takes less than a second to compile with any compiler we tried.
 Not that it all was needed to make the program portable and easy to build,
 but when you start removing dependencies, the tendency is to push it
 as far as you can.
-*/
 
-/********************************************************************************************/
+
+********************************************************************************************/
 
 #include <stdio.h>  /* (s)printf fopen fclose fseek fread fwrite fflush */
-#include <math.h>   /* pow sqrt exp fabs */
 
 
 /****************************** Neural Net data strucutres **********************************/
@@ -141,6 +140,7 @@ int min(int a, int b) { return a<b ? a : b; }
 int max(int a, int b) { return a>b ? a : b; }
 
 float sqr(float x) { return x*x; }
+float absf(float x) { return x>=0.0 ? x : -x; }
 
 float sign(float v) {
     if (v>0.0) { return 1.0;}
@@ -148,6 +148,33 @@ float sign(float v) {
     return 0.0;
 }
 
+const float LOG_2 = 0.6931471805599453f;
+
+float expf(float x) {
+    float x2, exp, y, s;
+    int i;
+    if (x>0.0) {
+        return 1.0/expf(-x);
+    }
+    x2 = x / LOG_2;
+    i = (int)x2;
+    if (127+i < 1) {
+        /* we could have used subnormals for very small numbers, but this
+        doesn't seem to make meaningful difference here */
+        return 0.0f; 
+    }
+    /* our trusty float exp2 table happens to be useful */
+    exp = float32_exp_table[127+i];
+    /* Taylor series */
+    x = (x2-i)*LOG_2; /*x in (-LOG_2, 0] */
+    y = x;
+    s = y;
+    for (i=2; i<10; ++i) {
+        y *= x/i;
+        s += y;
+    }
+    return exp*(1.0+s);
+}
 
 /********************************************************************************************/
 /*                              Neural Net layer functions                                  */
@@ -234,6 +261,16 @@ void relu_func(const op_ref_t * op, run_mode_t mode) {
     }
 }
 
+float root4(float y) {
+    float x = 1.0;
+    int i = 0;
+    if (y>1.0)  { return 1.0f/root4(1.0f/y); }
+    if (y==0.0) { return 0.0; }
+    for (; i<8; ++i) {
+        x = 0.75f*x + y/(4.0f*x*x*x);     
+    }
+    return x;
+}
 
 void lrn_func(const op_ref_t * op, run_mode_t mode) {
     int size = op->input[0]->size;
@@ -254,7 +291,9 @@ void lrn_func(const op_ref_t * op, run_mode_t mode) {
                 ssum += sqr(input[row+j]);
             }
             norm = p.bias + ssum*p.alpha;
-            norm_pow = pow(norm, -p.beta);
+            /* norm_pow = pow(norm, -p.beta), but beta==0.75 for Inception V1,
+            so I use a custom root4 function to avoid depending on math.h */
+            norm_pow = root4(norm)/norm;
             if (mode==RUN_FORWARD) {
                 output[row+i] = input[row+i] * norm_pow;
             } else {
@@ -366,7 +405,7 @@ void softmax_func(const op_ref_t * op, run_mode_t mode) {
             max_logit = maxf(max_logit, input[i]);
         }
         for (i=0; i<size; ++i) {
-            float e = exp(input[i]-max_logit);
+            float e = expf(input[i]-max_logit);
             output[i] = e;
             exp_sum += e;
         }
@@ -450,8 +489,8 @@ int validate_buffer(const char *fn, const int size, const float * buf) {
               break;
           }
           v = parse_float32(tmp);
-          acc_v += fabs(v);
-          max_dv = maxf(max_dv, fabs(v-buf[i]));
+          acc_v += absf(v);
+          max_dv = maxf(max_dv, absf(v-buf[i]));
     }
     if (i == size) {
         acc_v /= size;
@@ -646,13 +685,13 @@ void copy_net2img(int ofs_x, int ofs_y) {
     }
 }
 
-void print_bar(const char * c, int i, int target) {
+void print_bar(const char * c, int layer_i, int target) {
     const int skip = 10;
     int k;
-    i /= skip;
+    layer_i /= skip;
     printf("\r[");
     for (k=0; k<target/skip; ++k) {
-        printf("%s", k==i?c:"-");
+        printf("%s", k==layer_i?c:"-");
     }
     printf("]");
     fflush(stdout);
@@ -661,7 +700,7 @@ void print_bar(const char * c, int i, int target) {
 void forward(int target) {
     int i;
     for (i=0; i<=target; ++i) {
-        if (i%10==0) {
+        if (i%1==0) {
             print_bar(">", i, target);
         }
         g_ops[i].run(g_ops+i, RUN_FORWARD);
@@ -671,7 +710,7 @@ void forward(int target) {
 void backward(int target) {
     int i;
     for (i=target; i>=0; --i) {
-        if (i%10==0) {
+        if (i%1==0) {
             print_bar("<", i, target);
         }
         g_ops[i].run(g_ops+i, RUN_BACKWARD);
@@ -758,12 +797,11 @@ void render_octave(int target_i) {
             backward(target_i);
             acc = 0.0;
             for (i=0; i<g_data.size; ++i) {
-                acc += sqr(g_data.grad[i]);
+                acc += absf(g_data.grad[i]);
             }
-            //acc /= g_data.size;
-            acc = sqrt(acc);
+            acc /= g_data.size;
             for (i=0; i<g_data.size; ++i) {
-                g_data.val[i] += 800.0*g_data.grad[i]/acc; /*1000.0*/
+                g_data.val[i] += 1.5*g_data.grad[i]/acc;
             }
             copy_net2img(x+sx, y+sy);
             printf(" %d/%d %d/%d ", tile_count+1, tile_n, step+1, step_n);
@@ -797,11 +835,11 @@ int main(int arvc, const char * argv[]) {
     if (load_bmp("cat_dog224.bmp") != 0) {
         return 1;
     }
-    copy_img2net(0, 0);
-    validate_model();
+    //copy_img2net(0, 0);
+    //validate_model();
     
     //run_adversarial();
-    run_deepdream(1);
+    run_deepdream(7);
 
 
     /*printf("\033[2J\033[H");*/

@@ -1,22 +1,29 @@
 /********************************************************************************************
 
-
-We didn't have Tensorflow, PyTorch, JAX, Caffe or any other differentiable
-programming framework. We didn't have BLAS and any library for image loading,
-saving and resizing. We refrained from using dynamic memory allocation and
+I didn't use Tensorflow, PyTorch, JAX, Caffe or any other differentiable
+programming framework. I didn't use BLAS and any library for image loading,
+saving and resizing. I refrained from using dynamic memory allocation and
 ditched the assumption that the CPU uses IEEE-754 standard to represent
-floating-point numbers. We restricted the code to the subset of C89
-language, excluding preprocessor macros and many other things. Our only
-includes were <stdio.h> and <math.h>. We made sure that the program
-takes less than a second to compile with any compiler we tried.
+floating-point numbers. I restricted the code to the subset of C89
+language, excluding preprocessor macros and many other things. The only 
+included header is <stdio.h>. The program takes less than a second
+to compile with any compiler I've tried.
+
 Not that it all was needed to make the program portable and easy to build,
 but when you start removing dependencies, the tendency is to push it
 as far as you can.
 
-
 ********************************************************************************************/
 
 #include <stdio.h>  /* (s)printf fopen fclose fseek fread fwrite fflush */
+
+const int ADVERSARIAL_CLASS = 852;   /* tennis ball */
+const int ADVERSARIAL_STEP_NUM = 5;
+
+/* see g_ops array in "inception.inc" for the list of layers */
+const char * DEEPDREAM_LAYER_NAME = "inception_4c_output";
+const int DEEPDREAM_OCTAVE_NUM = 1;
+const int DEEPDREAM_STEP_NUM = 1;
 
 
 /****************************** Neural Net data strucutres **********************************/
@@ -95,6 +102,15 @@ void fill_zeros(int n, float * a) {
     }
 }
 
+int strcmp(const char * sl, const char * sr) {
+  const uint8 *l = (const uint8 *)sl;
+  const uint8 *r = (const uint8 *)sr;
+  while (*l==*r && *l) {
+    ++l; ++r;
+  }
+  return *l-*r;
+}
+
 /*************** IEEE-754 32-bit float parsing (little-endian) ****************/
 enum {
   FLOAT32_SIZE = 4,
@@ -112,7 +128,9 @@ void init_float32_exp() {
         b *= 2.0;
     }
     float32_exp_table[0] = float32_exp_table[1]; /* subnomal */
-    float32_exp_table[255] = 1.0/0.0;            /* infinity */
+    /* The last table element supposed to be infinity, but MSVC-compiled 
+       binaries crashed with Division-by-Zero here */
+    /* float32_exp_table[255] = 1.0/0.0; */      /* infinity */
 }
 
 float parse_float32(const uint8 * p) {
@@ -120,7 +138,7 @@ float parse_float32(const uint8 * p) {
     int exponent = ((p[3]&0x7f)<<1) + (p[2]>>7);
     int mantissa = ((p[2]&0x7f)<<16) + (p[1]<<8) + p[0];
     if (exponent == 255 && mantissa != 0) {
-        return 0.0/0.0; /* Not a Number */
+        return 0.0; /* Must be Not a Number (0.0/0.0) */
     }
     if (exponent > 0) { /* normal number */
         mantissa |= FLOAT32_MANTISSA_BIT;
@@ -432,9 +450,11 @@ void softmax_func(const op_ref_t * op, run_mode_t mode) {
 /*                              Initialization and support                                  */
 /********************************************************************************************/
 
-void init_consts() {
-    FILE *f=fopen(model_filename, "rb");
+void load_weights() {
+    FILE *f;
     const const_t * c = g_consts;
+    printf("Loading neural weights from '%s'...\n", model_filename);
+    f=fopen(model_filename, "rb");
     for (; c<g_consts+g_consts_num; ++c) {
         int i, j, k;
         float * val = c->data->val;
@@ -536,37 +556,6 @@ void print_top_scores() {
         printf("  %.3f %d %s\n", score[i], j, pred_labels[j]);
     }
     printf("\n");
-}
-
-void validate_model() {
-    int i;
-    char fn[1024];
-    const op_ref_t * op;
-
-    printf("validating the model\n");
-    for (i=0; i<g_ops_num; ++i) {
-        op = g_ops+i;
-        op->run(op, RUN_FORWARD);
-        sprintf(fn, "test/%s", op->name);
-        if (validate_buffer(fn, op->output->size, op->output->val) != 0) {
-            write_data(fn+5, op->output->size, op->output->val);
-            return;
-        }
-    }
-    print_top_scores();
-    reset_gradients();
-    g_prob.grad[162] = 1.0;
-
-    for (i=g_ops_num-1; i>=0; --i) {
-        op = g_ops+i;
-        sprintf(fn, "test/grad_%s", op->name);
-        if (validate_buffer(fn, op->output->size, op->output->grad) != 0) {
-            write_data(fn+5, op->output->size, op->output->grad);
-            return;
-        }
-        op->run(op, RUN_BACKWARD);
-    }
-
 }
 
 
@@ -717,14 +706,46 @@ void backward(int target) {
     }
 }
 
+void validate_model() {
+    int i;
+    char fn[1024];
+    const op_ref_t * op;
+
+    printf("validating the model\n");
+    copy_img2net(0, 0);
+    for (i=0; i<g_ops_num; ++i) {
+        op = g_ops+i;
+        op->run(op, RUN_FORWARD);
+        sprintf(fn, "test/%s", op->name);
+        if (validate_buffer(fn, op->output->size, op->output->val) != 0) {
+            write_data(fn+5, op->output->size, op->output->val);
+            return;
+        }
+    }
+    print_top_scores();
+    reset_gradients();
+    g_prob.grad[162] = 1.0;
+
+    for (i=g_ops_num-1; i>=0; --i) {
+        op = g_ops+i;
+        sprintf(fn, "test/grad_%s", op->name);
+        if (validate_buffer(fn, op->output->size, op->output->grad) != 0) {
+            write_data(fn+5, op->output->size, op->output->grad);
+            return;
+        }
+        op->run(op, RUN_BACKWARD);
+    }
+
+}
+
 void run_adversarial() {
     int pass, i;
     copy_img2net(0, 0);
     forward(g_ops_num-1);
     print_top_scores();
 
-    for (pass=0; pass<5; ++pass) {
-        g_prob.grad[852] = 1.0;  /* tennis ball */
+    for (pass=0; pass<ADVERSARIAL_STEP_NUM; ++pass) {
+        g_prob.grad[ADVERSARIAL_CLASS] = 1.0;
         backward(g_ops_num-1);
         for (i=0; i<g_data.size; ++i) {
             g_data.val[i] += sign(g_data.grad[i])*0.5;
@@ -734,13 +755,12 @@ void run_adversarial() {
         print_top_scores();
     }
     copy_net2img(0, 0);
-    save_bmp("t.bmp");
 }
 
 int find_layer(const char * name) {
     int i=0;
     for (; i<g_ops_num; ++i) {
-        if (g_ops[i].name == name) {
+        if (strcmp(g_ops[i].name, name) == 0) {
             return i;
         }
     }
@@ -774,27 +794,27 @@ void upscale_image() {
     g_img_height = new_height;
 }
 
-void render_octave(int target_i) {
+void render_octave(int layer_i, int octave_i) {
     const int tile_size = g_data.shape[0];
-    const int step_n = 20;
-    const tensor_t * target = g_ops[target_i].output;
+    const tensor_t * target = g_ops[layer_i].output;
     float acc;
+    char s[128];
     int x, y, i, step;
     int tile_h = (g_img_height+tile_size-1)/tile_size;
     int tile_w = (g_img_width+tile_size-1)/tile_size;
     int tile_n=tile_w*tile_w;
-    for (step=0; step<step_n; ++step) {
+    for (step=0; step<DEEPDREAM_STEP_NUM; ++step) {
         int sx=step*79, sy=step*127;
         int tile_count=0;
         for (y=0; y<g_img_height; y+=tile_size)
         for (x=0; x<g_img_width; x+=tile_size, ++tile_count) {
             copy_img2net(x+sx, y+sy);
-            forward(target_i);
+            forward(layer_i);
             reset_gradients();
             for (i=0; i<target->size; ++i) {
                 target->grad[i] = target->val[i];
             }
-            backward(target_i);
+            backward(layer_i);
             acc = 0.0;
             for (i=0; i<g_data.size; ++i) {
                 acc += absf(g_data.grad[i]);
@@ -804,45 +824,87 @@ void render_octave(int target_i) {
                 g_data.val[i] += 1.5*g_data.grad[i]/acc;
             }
             copy_net2img(x+sx, y+sy);
-            printf(" %d/%d %d/%d ", tile_count+1, tile_n, step+1, step_n);
+            printf(" tile: %d/%d  step: %d/%d  octave: %d ", tile_count+1, tile_n, step+1, step_n, octave_i);
         }
     }
 }
 
 void run_deepdream(int octave_n) {
-    int target_i = find_layer("inception_4c_output"); /*pool4 4c*/ // pool3_3x3_s2 pool3_3x3_s2
+    int target_i = find_layer(DEEPDREAM_LAYER_NAME);
+    if (target_i < 0) {
+        printf("Unable to find layer '%s'!\n", DEEPDREAM_LAYER_NAME);
+        return;
+    }
+    printf("running %d octaves of DeepDream ...\n", octave_n);
     int octave;
-    char s[128];
+    char fn[128];
     for (octave=0; octave<octave_n; ++octave) {
         if (octave > 0) {
             upscale_image();
         }
-        render_octave(target_i);
-        sprintf(s, "out%d.bmp", octave);
-        save_bmp(s);
-        printf("saved %dx%d\n", g_img_width, g_img_height);
+        render_octave(target_i, octave);
+        sprintf(fn, "octave_%d.bmp", octave);
+        save_bmp(fn);
+        printf("\nsaved '%s' (%dx%d)\n", fn, g_img_width, g_img_height);
     }
 }
 
-int main(int arvc, const char * argv[]) {
-    int x, y, c, i, pass;
-    const int data_w = 224;
-    FILE * f;
-  
-    init_float32_exp();
-    init_consts();
+const char * help_str = 
+"deepdream.c -- minimal DeepDream Generator\n\n";
 
-    if (load_bmp("cat_dog224.bmp") != 0) {
+enum {MODE_DREAM, MODE_ADV, MODE_CLASSIFY, MODE_TEST};
+
+int main(int arvc, const char * argv[]) {
+    int mode = MODE_DREAM;
+    const char * input_name = "cat_dog224.bmp";
+    const char * output_name = "output.bmp";
+    int i;
+    for (i=1; i<arvc; ++i) {
+        if (strcmp("-h", argv[i]) == 0) {
+            printf("%s", help_str);
+        } else if (strcmp("-i", argv[i]) == 0 && i+1 < arvc) {
+            input_name = argv[i+1];
+            ++i;
+        } else if (strcmp("-o", argv[i]) == 0 && i+1 < arvc) {
+            output_name = argv[i+1];
+            ++i;
+        } else if (strcmp("dream", argv[i]) == 0) {
+            mode = MODE_DREAM;
+        } else if (strcmp("classify", argv[i]) == 0) {
+            mode = MODE_CLASSIFY;
+        } else if (strcmp("test", argv[i]) == 0) {
+            mode = MODE_TEST;
+        } else if (strcmp("adversarial", argv[i]) == 0) {
+            mode = MODE_ADV;
+        } else {
+            printf("Unknown argument '%s'!\n", argv[i]);
+            return 1;
+        }
+    }
+
+    init_float32_exp();
+    load_weights();
+
+    if (load_bmp(input_name) != 0) {
         return 1;
     }
-    //copy_img2net(0, 0);
-    //validate_model();
-    
-    //run_adversarial();
-    run_deepdream(7);
-
-
-    /*printf("\033[2J\033[H");*/
-
+    if (mode == MODE_TEST) {
+        validate_model();
+    }
+    if (mode == MODE_CLASSIFY) {
+        copy_img2net(0, 0);
+        forward(g_ops_num-1);
+        print_top_scores();
+    }
+    if (mode == MODE_DREAM) {
+        run_deepdream(DEEPDREAM_OCTAVE_NUM);
+        save_bmp(output_name);
+        printf("Saved '%s'\n", output_name);
+    }
+    if (mode == MODE_ADV) {
+        run_adversarial();
+        save_bmp(output_name);
+        printf("Saved '%s'\n", output_name);
+    }
     return 0;
 }

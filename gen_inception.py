@@ -1,8 +1,7 @@
+import os
+import sys
 import numpy as np
 import tensorflow as tf
-
-# tf.config.threading.set_intra_op_parallelism_threads(1)
-# tf.config.threading.set_inter_op_parallelism_threads(1)
 
 model_fn = 'InceptionV1.pb'
 
@@ -14,7 +13,6 @@ with graph.as_default():
 
 DT_FLOAT = 1
 FLOAT_SIZE = 4
-
 
 total_mem = 0
 last_const_ofs = 0
@@ -41,11 +39,15 @@ def make_tensor(tensor, is_const):
         return False
     shape = tensor.shape
     if not is_const:
-        shape = shape[1:]    # strip batch dim
-        if len(shape) == 1:  # unify matmul and conv2d
+        shape = shape[1:]  # remove batch dimension (we assume it's always 1)
+        if len(shape) == 1:
+            # adding dummy spatial dimensions to matmul
+            # inputs and outputs to unify them with conv2d
             shape = (1, 1) + shape
     else:
-        if len(shape) == 2:  # unify matmul and conv2d
+        if len(shape) == 2:
+            # 2d weight matrices are used by 'matmul' layers, we add
+            # dummy filter sizes to unify them with 'conv2d' layers
             shape = (1, 1) + shape
     ndim = len(shape)
     name = get_cname(tensor.name)
@@ -53,10 +55,8 @@ def make_tensor(tensor, is_const):
     size = np.prod(shape)
     val_ptr = f"g_mem+{total_mem}"
     total_mem += size
-    grad_ptr = 'NULL'
-    if True:  # not is_const:
-        grad_ptr = f"g_mem+{total_mem}"
-        total_mem += size
+    grad_ptr = f"g_mem+{total_mem}"
+    total_mem += size
     tensors.append(
         f'const tensor_t {name} = {{ {val_ptr}, {grad_ptr}, {size}, {ndim}, {shape_str} }};\n')
     return True
@@ -138,26 +138,39 @@ with open('inception.inc', 'w') as f:
         f.write(f'  "{s}",\n')
     f.write('};\n')
 
-print('total_mem (mb)', total_mem*FLOAT_SIZE/2**20)
+print('generated "inception.inc"')
+print('%.1f MB memory used for networ'%(total_mem*FLOAT_SIZE/2**20))
 
+if len(sys.argv) > 1 and sys.argv[1] == 'test':
+    print('\ngenerating test data...')
+    os.makedirs('test', exist_ok=True)
 
-# del graph_def.node[0]  # placeholder
+    bmp_data = open('cat_dog224.bmp', 'rb').read()
+    input_image = tf.image.decode_bmp(bmp_data)
+    input_image = tf.cast(input_image, tf.float32)
 
-# @tf.function
-# def run_model(x):
-#     prob = tf.import_graph_def(graph_def, {'data':x}, ['prob:0'])[0]
-#     obj = prob[0, 162]
-#     grad = tf.gradients(obj, x)
-#     return prob, grad
+    tensors = [n.name+':0' for n in graph_def.node if len(n.input)]
 
-# x = np.float32(np.random.rand(1, 224, 224, 3))
-# obj, g = run_model(x)
-# print(g)
+    imagenet_mean = np.float32([122.7, 116.7, 104.0])
 
-# import time
-# start = time.time()
-# n = 100
-# for i in range(n):
-#     run_model(x)
-# print((time.time()-start)/n*1000)
+    @tf.function
+    def run_model(x, target_label=162):
+        data = (x-imagenet_mean)[None,:,:,::-1] # rgb->bgr
+        data = tf.identity(data, 'data')
+        outputs = tf.import_graph_def(graph_def, {'data':data}, tensors, name='')
+        outputs = dict(zip(tensors, outputs))
+        objective = outputs['prob:0'][0, target_label]
 
+        grad_tensors = [t.op.inputs[0] for t in outputs.values() if t.op.inputs[0].op.type != 'Reshape']
+        grads = tf.gradients(objective, grad_tensors)
+        grads = {'grad_'+t.name:g for t, g in zip(grad_tensors, grads)}
+        outputs.update(grads)
+
+        outputs['data'] = data
+        outputs = {get_cname(k)[2:]:v for k, v in outputs.items()}
+        return outputs
+
+    outputs = run_model(input_image)
+    for name, v in outputs.items():
+        if v is not None:
+            v.numpy().tofile('test/'+name)

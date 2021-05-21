@@ -32,7 +32,7 @@ todo: add pedantic command lines
 
 The `deepdream` binary uses the following command line format:
 
-    deepdream [mode] [-i input.bmp] [-o output.bmp]
+    deepdream [mode] [-h] [-i input.bmp] [-o output.bmp]
 
 `mode` is one of:
 
@@ -43,6 +43,11 @@ The `deepdream` binary uses the following command line format:
 
 `-i` and `-o` flags specify input and output images correspondingly. Only 24-bit color BMP files are supported. Default input is `cat_dog224.bmp`
 
+`-h` -- print help message
+
+### Setting other options
+
+As of now all other parameters are configured through the global constants at the beginning of `deepdream.c`. Given the negligible compilation times this seems to be a viable mechanism. Later some of these constants may be promoted to flags.
 
 ## History and motivation 
 
@@ -88,7 +93,7 @@ Thanks to:
 
 * Caffe authors for creating a framework that I was using in my early experiments
 
-* Sergio Guadarrama for releasing the Caffe version of the Inception model
+* Sergio Guadarrama for releasing the Caffe version of the Inception-V1 model
 
 * Google for supporting my work on reverse-engineering Deep Neural Networks
 

@@ -22,8 +22,8 @@ const int ADVERSARIAL_STEP_NUM = 5;
 
 /* see g_ops array in "inception.inc" for the list of layers */
 const char * DEEPDREAM_LAYER_NAME = "inception_4c_output";
-const int DEEPDREAM_OCTAVE_NUM = 1;
-const int DEEPDREAM_STEP_NUM = 1;
+const int DEEPDREAM_OCTAVE_NUM = 7;
+const int DEEPDREAM_STEP_NUM = 20;
 
 
 /****************************** Neural Net data strucutres **********************************/
@@ -800,10 +800,11 @@ void render_octave(int layer_i, int octave_i) {
     float acc;
     char s[128];
     int x, y, i, step;
+    const int step_n = DEEPDREAM_STEP_NUM;
     int tile_h = (g_img_height+tile_size-1)/tile_size;
     int tile_w = (g_img_width+tile_size-1)/tile_size;
     int tile_n=tile_w*tile_w;
-    for (step=0; step<DEEPDREAM_STEP_NUM; ++step) {
+    for (step=0; step<step_n; ++step) {
         int sx=step*79, sy=step*127;
         int tile_count=0;
         for (y=0; y<g_img_height; y+=tile_size)
@@ -849,9 +850,6 @@ void run_deepdream(int octave_n) {
     }
 }
 
-const char * help_str = 
-"deepdream.c -- minimal DeepDream Generator\n\n";
-
 enum {MODE_DREAM, MODE_ADV, MODE_CLASSIFY, MODE_TEST};
 
 int main(int arvc, const char * argv[]) {
@@ -860,9 +858,7 @@ int main(int arvc, const char * argv[]) {
     const char * output_name = "output.bmp";
     int i;
     for (i=1; i<arvc; ++i) {
-        if (strcmp("-h", argv[i]) == 0) {
-            printf("%s", help_str);
-        } else if (strcmp("-i", argv[i]) == 0 && i+1 < arvc) {
+        if (strcmp("-i", argv[i]) == 0 && i+1 < arvc) {
             input_name = argv[i+1];
             ++i;
         } else if (strcmp("-o", argv[i]) == 0 && i+1 < arvc) {

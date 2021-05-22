@@ -31,15 +31,14 @@ A detailed backstory can be found
 Below is the short summary.
 
 This project was developed by me, Alexander Mordvintsev, to celebrate the 6th
-anniversary of the DeepDream creation. It all started with the art commission
+anniversary of DeepDream creation. It all started with an art commission
 request by the [k21.kanon.art](https://k21.kanon.art/) project. Originally we
 planned to recreate a few first DeepDream images by running the original code
 from 2015. However it happened to be surprisingly challenging to bring even just
 a few year old code to life given all the dependences. This resonated with my
 overall frustration with the excessive complexity, bloat and over-reliance on
 frameworks of modern software. I decided to see how difficult would it be to
-implement the whole thing from scratch, using the technologies that are
-available for at least 30 years old, but still in active use today.
+implement the whole thing from scratch, using  technologies that are at least 30 years old, but still in active use today.
 
 ## Usage
 
@@ -141,9 +140,9 @@ The repository contains following files:
 
 * The only library include is `<stdio.h>` (for file I/O and printing)
 * No use of dynamic memory allocation
-* No assumption that floats use IEEE-754 standard, so parsing network weights
+* No assumption that floats use IEEE-754 standard, parsing binary network weights
   manually
-* No `<math.h>` so use iterative approximations for `exp()` and `pow(..., 0.75)`
+* No `<math.h>`, use iterative approximations for `exp()` and `pow(..., 0.75)`
   (for LRN layers of Inception-V1)
 * Forward and backward operations share most of the code, so implementing
   back-propagation was relatively simple
